@@ -14,6 +14,37 @@ from textile.utils.misc import MyProgressBar
 from textile.utils.create_model import CreateModel
 
 
+if __name__ == "__main__":
+    import cv2
+    from textile.utils.image_utils import read_and_process_image
+
+    img_path = r"D:\textile\my_pattern\pattern1.png"
+    out_path = r"D:\textile\output_textile_result_pattern1_from_module.png"
+
+    image = read_and_process_image(img_path)
+    loss_textile = Textile()
+    value = loss_textile(image)
+
+    img = cv2.imread(img_path)
+    if img is not None:
+        result_img = np.tile(img, (2, 2, 1))
+        cv2.putText(
+            result_img,
+            f"TexTile: {value.detach().cpu().item():.6f}",
+            (20, 40),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1.0,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        cv2.imwrite(out_path, result_img)
+        print("saved:", out_path)
+        print("value:", value.detach().cpu().item())
+    else:
+        print("could not read image", img_path)
+
+
 class Textile(nn.Module):
     def __init__(self, model_path: str = "textile/models/textile.pth", lambda_value: float = 0.25, resolution = (512, 512), number_tiles = 2):
         """
@@ -25,9 +56,10 @@ class Textile(nn.Module):
         """
         super(Textile, self).__init__()
 
-        assert torch.cuda.is_available()
         assert model_path.endswith('.pth')
         assert lambda_value >= 0 and lambda_value <= 1
+
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
         is_model_on_disc = os.path.exists(model_path)
@@ -42,8 +74,8 @@ class Textile(nn.Module):
                 print('Could not retrieve pretrained model')
                 raise e
 
-        self.model = CreateModel(model_path).cuda().eval()
-        self.lambda_value = torch.tensor(lambda_value)
+        self.model = CreateModel(model_path).to(self.device).eval()
+        self.lambda_value = torch.tensor(lambda_value, device=self.device)
         self.t_resized = transforms.Resize(resolution, antialias=True)
         self.transform = nn.Sequential(
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
@@ -72,7 +104,8 @@ class Textile(nn.Module):
         if normalize:
             image = self.transform(image)
 
-        result = self.model(image.float().cuda())
+        image = image.to(self.device)
+        result = self.model(image.float())
         if return_logits is False:
             result = 1 / (1 + torch.exp((-self.lambda_value * result)))
 

@@ -36,6 +36,7 @@ def CreateModel(pre_trained_network=None):
 
     if pre_trained_network is not None:
         # print("Reading model from disc")
-        model_weights = torch.load(pre_trained_network)
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        model_weights = torch.load(pre_trained_network, map_location=device)
         model.load_state_dict(model_weights, strict=False)
     return model
