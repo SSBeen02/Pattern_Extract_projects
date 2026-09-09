@@ -13,3 +13,5 @@ __pycache__/
 
 # CSV data files (case-insensitive extension)
 *.[cC][sS][vV]
+
+*.pptx
