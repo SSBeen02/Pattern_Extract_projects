@@ -15,3 +15,5 @@ __pycache__/
 *.[cC][sS][vV]
 
 *.pptx
+
+textile/
