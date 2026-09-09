@@ -17,3 +17,6 @@ __pycache__/
 *.pptx
 
 textile/
+
+*.pdf
+*.pth
