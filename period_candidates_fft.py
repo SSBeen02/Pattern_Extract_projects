@@ -6,28 +6,24 @@ from dataclasses import dataclass
 from typing import List, Tuple
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw
 
 from period_candidates_visualization import (
     draw_frequency_domain_peaks,
-    draw_grid_patch_preview,
     draw_spatial_domain_peaks,
     save_axis_period_functions,
     save_patch_box_preview,
-    save_patch_montage,
+    safe_font,
 )
 
 
-VISUAL_CANDIDATE_LIMIT = 2
-FREQUENCY_SEARCH_BOX_SIZE = 256
-FREQUENCY_DISPLAY_BOX_SIZE = 200
 AXIS_PROFILE_MAX_K = 100
-AXIS_DUPLICATE_K_THRESHOLD = 4.0
 AXIS_PEAK_RELATIVE_THRESHOLD = 0.73
-NCC_TOP_LOCAL_MAXIMA = 10
+MIN_PERIOD = 10.0
+MAX_PERIOD = 256.0
+#k range is 4~100
 
-
-# Step 0: Candidate data saved to CSV and reused by the visualization steps.
+# Period candidates shared by visualization and patch extraction.
 @dataclass
 class FftPeakCandidate:
     candidate_id: int
@@ -51,6 +47,14 @@ class AxisPeriodPeak:
     source: str = ""
 
 
+@dataclass
+class PatchResult:
+    image_patch: Image.Image
+    extended: Image.Image
+    reference: Image.Image | None
+    metadata: dict
+
+
 def ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
@@ -62,70 +66,22 @@ def load_rgb(path: str) -> Tuple[Image.Image, np.ndarray]:
 
 
 def normalize_channel(channel: np.ndarray) -> np.ndarray:
-    """채널 또는 1D 신호를 평균 0, 표준편차 1에 가깝게 표준화한다.
-
-    ``channel``은 RGB 이미지의 단일 채널 배열((height, width))일 수도 있고,
-    이미지의 x/y 방향 평균 투영으로 만든 1D 신호((width) 또는 (height))일
-    수도 있다. 입력의 shape과 샘플 순서는 유지하고 값의 기준과 스케일만
-    바꾼다.
-
-    평균을 빼면 전체 밝기나 기본 기준선이 제거된다. 이어서 표준편차로 나누면
-    서로 다른 밝기와 대비를 가진 채널도 비슷한 스케일에서 FFT로 비교할 수
-    있다. 이 과정은 픽셀 위치를 이동하거나 주기를 변경하지 않는다.
-    """
-    # Step 2a: 전체 평균을 빼서 신호의 중심을 0으로 이동한다.
-    # 예를 들어 [100, 110, 120]은 평균 110을 빼고 [-10, 0, 10]이 된다.
-    # 일정한 밝기 성분은 FFT에서 DC 성분(k=0)으로 모이므로, 반복 변화에
-    # 집중하려면 FFT를 수행하기 전에 이 기준선을 제거해야 한다.
+    """평균을 제거하고 표준편차로 나눈다. 상수 신호는 나눗셈을 생략한다."""
     channel = channel - float(channel.mean())
-
-    # Step 2b: 평균 제거 후 값의 퍼짐 정도를 계산한다.
-    # 표준편차가 크면 채널의 대비/변동이 크고, 작으면 거의 평평한 신호이다.
     std = float(channel.std())
     if std > 1e-6:
-        # Step 2c: 충분히 변하는 신호만 표준편차로 나눈다.
-        # 결과는 평균 0, 표준편차 약 1이 되어 채널별 절대 대비 차이를 줄인다.
         channel = channel / std
-    else:
-        # Step 2d: 상수에 가까운 신호는 표준편차가 사실상 0이다.
-        # 이때 나누면 NaN/inf가 생기므로 나누지 않고 평균 제거 결과를 유지한다.
-        pass
-
-    # Step 2e: 후속 FFT 계산의 자료형과 메모리 사용량을 일관되게 유지한다.
     return channel.astype(np.float32)
 
 
-
 def normalize_01(values: np.ndarray) -> np.ndarray:
-    """배열 내부의 유한한 값들을 선형적으로 0~1 범위에 매핑한다.
-
-    변환식은 ``(values - lo) / (hi - lo)``이다. 여기서 ``lo``와 ``hi``는
-    입력 배열의 유한한 최솟값과 최댓값이다. 따라서 최솟값은 0, 최댓값은 1이
-    되고 중간 값의 상대적인 순서는 유지된다. 입력의 shape은 그대로 보존된다.
-
-    FFT 진폭처럼 절대 크기보다 배열 안에서 어느 값이 큰지가 중요한 데이터를
-    시각화하거나 피크 비교용으로 바꿀 때 사용한다. NaN과 +/-inf는 범위를
-    계산할 때 제외하지만, 그 위치를 자동으로 다른 값으로 치환하지는 않는다.
-    """
-    # Step 2f: 범위 계산에 사용할 유한한 값만 추린다.
-    # np.isfinite()는 NaN, +inf, -inf가 아닌 값에서만 True를 반환한다.
+    """유한한 최솟값·최댓값으로 0~1 정규화하며 상수 배열은 0으로 만든다."""
     finite = values[np.isfinite(values)]
     if finite.size == 0:
-        # 유효한 값이 하나도 없으면 최소/최대값을 정할 수 없다.
-        # 입력과 같은 shape의 0 배열을 반환해 후속 계산을 안전하게 종료한다.
         return np.zeros(values.shape, dtype=np.float32)
-
-    # Step 2g: 유한한 값들의 양 끝 범위를 찾는다.
-    lo = float(finite.min())
-    hi = float(finite.max())
+    lo, hi = float(finite.min()), float(finite.max())
     if hi <= lo:
-        # hi == lo이면 모든 유효한 값이 같아 분모가 0이 된다.
-        # 값 사이의 상대적인 차이도 없으므로 전체를 0으로 표현한다.
         return np.zeros(values.shape, dtype=np.float32)
-
-    # Step 2h: lo~hi 구간을 0~1 구간으로 선형 변환한다.
-    # 유한한 입력값은 0~1로 변환되며, 입력에 있던 NaN/inf는 자동 복구하지
-    # 않으므로 해당 위치에는 비유한 값이 남을 수 있다.
     return ((values - lo) / (hi - lo)).astype(np.float32)
 
 
@@ -149,7 +105,7 @@ def axis_period_profiles(
     min_period: float,
     max_period: float,
     max_k: int = AXIS_PROFILE_MAX_K,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[AxisPeriodPeak], List[AxisPeriodPeak]]:  #이 함수가 이런 타입의 값 5개를 반환한다”는 타입 설명
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[AxisPeriodPeak], List[AxisPeriodPeak]]:
     # Step 4: Collapse RGB image channels into x/y 1D signals and run 1D FFT.
     # 반복 무늬가 이미지의 어느 축 방향으로 나타나는지 축별로 분석한다.
     h, w, _channels = rgb.shape
@@ -191,12 +147,10 @@ def axis_period_profiles(
     if not np.any(valid_y):
         valid_y = np.ones(ks.shape, dtype=bool)
 
-    # 가장 강한 기본 주기 하나씩을 선택해 후속 후보 생성에 전달한다.
-    peaks_x = select_axis_amplitude_peaks("x", ks, amp_x, valid_x, w, count=1)
-    peaks_y = select_axis_amplitude_peaks("y", ks, amp_y, valid_y, h, count=1)
+    # 기준을 통과하는 가장 작은 k의 피크를 축별로 선택한다.
+    peaks_x = select_axis_amplitude_peaks("x", ks, amp_x, valid_x, w)
+    peaks_y = select_axis_amplitude_peaks("y", ks, amp_y, valid_y, h)
     return ks, amp_x, amp_y, peaks_x, peaks_y
-
-
 
 
 def subpixel_peak_1d(v_minus: float, v_zero: float, v_plus: float) -> float:
@@ -229,210 +183,53 @@ def refine_profile_peak(ks: np.ndarray, values: np.ndarray, peak_index: int) -> 
 
 
 def select_axis_amplitude_peaks(
-    axis: str,
-    ks: np.ndarray,
-    amplitude: np.ndarray,
-    valid: np.ndarray,
-    image_size: int,
-    count: int = 2,
+    axis: str, ks: np.ndarray, amplitude: np.ndarray,
+    valid: np.ndarray, image_size: int,
 ) -> List[AxisPeriodPeak]:
-    # Step 6: Pick the earliest local peak whose amplitude is close enough to the strongest peak.
-    # This favors the first plausible fundamental period over later harmonics with slightly higher amplitude.
-    peaks: List[AxisPeriodPeak] = []
-
-    valid_indices = np.where(valid)[0]
-    if valid_indices.size == 0:
-        # 허용 주기 범위에 해당하는 FFT bin이 없으면 후보를 만들 수 없다.
-        return peaks
-
-    max_amplitude = float(np.max(amplitude[valid_indices]))
-    threshold = AXIS_PEAK_RELATIVE_THRESHOLD
-    local_peak_indices: List[int] = []
-    for peak_index in valid_indices:
-        peak_index = int(peak_index)
-        # 현재 bin이 양옆보다 크고, 설정한 진폭 기준 이상인지 확인한다.
-        left = float(amplitude[peak_index - 1]) if peak_index > 0 else -np.inf
-        center = float(amplitude[peak_index])
-        right = float(amplitude[peak_index + 1]) if peak_index < amplitude.size - 1 else -np.inf
-        if center >= threshold and center >= left and center >= right:
-            local_peak_indices.append(peak_index)
-
-    # If the relative threshold is too strict for a noisy profile, fall back to the strongest valid point.
-    if not local_peak_indices:
-        local_peak_indices = [int(valid_indices[int(np.argmax(amplitude[valid_indices]))])]
-
-    # k가 작은 순서부터 확인하여 기본 주기에 가까운 후보를 우선 선택한다.
-    for peak_index in sorted(local_peak_indices, key=lambda idx: float(ks[idx])):
-        k, amplitude_value = refine_profile_peak(ks, amplitude, peak_index)
-        if any(abs(k - peak.k) < AXIS_DUPLICATE_K_THRESHOLD for peak in peaks):
-            continue
-        peaks.append(
-            AxisPeriodPeak(
-                axis=axis,
-                k=k,
-                period_px=float(image_size) / k if k > 0 else float("inf"),
-                amplitude=amplitude_value,
-                source="amplitude",
-            )
-        )
-        if len(peaks) >= count:
-            # 호출자가 요청한 개수만큼 모으면 탐색을 종료한다.
+    """0.73 이상인 국소 피크 중 가장 작은 k를 선택한다. 없으면 유효 최댓값 사용."""
+    indices = np.flatnonzero(valid)
+    if indices.size == 0:
+        return []
+    peak_index = int(indices[np.argmax(amplitude[indices])])
+    for index in sorted(indices, key=lambda i: float(ks[i])):
+        left = amplitude[index - 1] if index > 0 else -np.inf
+        right = amplitude[index + 1] if index < amplitude.size - 1 else -np.inf
+        if amplitude[index] >= AXIS_PEAK_RELATIVE_THRESHOLD and amplitude[index] >= max(left, right):
+            peak_index = int(index)
             break
-    return peaks
-
-
+    k, value = refine_profile_peak(ks, amplitude, peak_index)
+    return [AxisPeriodPeak(axis, k, image_size / k if k > 0 else float("inf"), value, "amplitude")]
 
 
 def candidates_from_axis_period_peaks(
-    mag: np.ndarray,
-    peaks_x: List[AxisPeriodPeak],
-    peaks_y: List[AxisPeriodPeak],
-    max_candidates: int,
+    image_shape: Tuple[int, int], peaks_x: List[AxisPeriodPeak], peaks_y: List[AxisPeriodPeak],
 ) -> List[FftPeakCandidate]:
-    # Step 7: Convert the selected x/y axis peaks into two axis-only candidates:
-    # (x1, 0), (0, y1).
-    h, w = mag.shape
-    cy, cx = h // 2, w // 2
-    candidates: List[FftPeakCandidate] = []
-
-    def add_candidate(kx: float, ky: float, score: float) -> None:
-        # Step 8: Convert frequency k into a spatial period vector dx, dy.
-        # 축 하나만 사용하는 후보에서는 다른 축의 k가 0이 된다.
-        if len(candidates) >= max_candidates:
-            return
-        denom = (kx / float(w)) ** 2 + (ky / float(h)) ** 2
-        if denom <= 0:
-            return
-
-        # 정규화된 주파수 벡터를 실제 픽셀 단위의 주기 벡터로 바꾼다.
-        dx = (kx / float(w)) / denom
-        dy = (ky / float(h)) / denom
-        period = math.hypot(dx, dy)
-        peak_x = float(cx) + kx
-        peak_y = float(cy) + ky
-
-        candidates.append(
-            FftPeakCandidate(
-                candidate_id=len(candidates) + 1,
-                peak_x=peak_x,
-                peak_y=peak_y,
-                kx=kx,
-                ky=ky,
-                dx=dx,
-                dy=dy,
-                period_px=period,
-                angle_deg=math.degrees(math.atan2(dy, dx)),
-                candidate_score=float(score),
-            )
-        )
-
-    if len(peaks_x) < 1 or len(peaks_y) < 1:
-        # x와 y 중 한 축의 기본 피크라도 없으면 축 후보를 만들지 않는다.
-        return candidates
-
-    # 가장 강한 x 주기와 y 주기를 각각 단독 후보로 만든다.
-    x1 = peaks_x[0]
-    y1 = peaks_y[0]
-    combos = [
-        (x1, None),
-        (None, y1),
-    ]
-    for peak_x_axis, peak_y_axis in combos:
-        kx = round(peak_x_axis.k, 1) if peak_x_axis else 0.0
-        ky = round(peak_y_axis.k, 1) if peak_y_axis else 0.0
-        score = 0.0
-        if peak_x_axis:
-            score += peak_x_axis.amplitude
-        if peak_y_axis:
-            score += peak_y_axis.amplitude
-        # 후보 점수는 선택된 축 피크의 진폭 합으로 기록한다.
-        add_candidate(kx, ky, score)
+    """축별 기본 피크를 x/y 공간 주기 후보로 변환한다."""
+    if not peaks_x or not peaks_y:
+        return []
+    h, w = image_shape
+    candidates = []
+    for axis, peak, size in (("x", peaks_x[0], w), ("y", peaks_y[0], h)):
+        k = round(peak.k, 1)
+        if k <= 0:
+            continue
+        period = size / k
+        kx, ky = (k, 0.0) if axis == "x" else (0.0, k)
+        dx, dy = (period, 0.0) if axis == "x" else (0.0, period)
+        candidates.append(FftPeakCandidate(
+            candidate_id=len(candidates) + 1, peak_x=w // 2 + kx, peak_y=h // 2 + ky,
+            kx=kx, ky=ky, dx=dx, dy=dy, period_px=period,
+            angle_deg=0.0 if axis == "x" else 90.0, candidate_score=float(peak.amplitude),
+        ))
     return candidates
 
 
-
 def center_patch_box(image: Image.Image, patch_w: int, patch_h: int) -> Tuple[int, int, int, int]:
-    # Step 12a: Locate a center-aligned patch with the requested period-scaled size.
+    """이미지 크기로 제한한 패치를 중앙에 배치한다. 기존 반올림 방식을 유지한다."""
     w, h = image.size
-    patch_w = max(1, min(w, patch_w))
-    patch_h = max(1, min(h, patch_h))
-    cx = w / 2.0
-    cy = h / 2.0
-    left = int(round(cx - patch_w / 2.0))
-    top = int(round(cy - patch_h / 2.0))
-    right = left + patch_w
-    bottom = top + patch_h
-
-    if left < 0:
-        right -= left
-        left = 0
-    if top < 0:
-        bottom -= top
-        top = 0
-    if right > w:
-        left -= right - w
-        right = w
-    if bottom > h:
-        top -= bottom - h
-        bottom = h
-
-    return left, top, right, bottom
-
-
-def sliding_window_sum(values: np.ndarray, window_h: int, window_w: int) -> np.ndarray:
-    integral = np.pad(values, ((1, 0), (1, 0)), mode="constant").cumsum(axis=0).cumsum(axis=1)
-    return (
-        integral[window_h:, window_w:]
-        - integral[:-window_h, window_w:]
-        - integral[window_h:, :-window_w]
-        + integral[:-window_h, :-window_w]
-    )
-
-
-def valid_cross_correlation_2d(source: np.ndarray, template: np.ndarray) -> np.ndarray:
-    h, w = template.shape[:2]
-    full_shape = (source.shape[0] + h - 1, source.shape[1] + w - 1)
-    corr = np.zeros((source.shape[0] - h + 1, source.shape[1] - w + 1), dtype=np.float64)
-    src_fft = np.fft.rfftn(source, s=full_shape, axes=(0, 1))
-    tpl_fft = np.fft.rfftn(template[::-1, ::-1], s=full_shape, axes=(0, 1))
-    conv = np.fft.irfftn(src_fft * tpl_fft, s=full_shape, axes=(0, 1))
-    corr[:, :] = conv[h - 1 : source.shape[0], w - 1 : source.shape[1]]
-    return corr
-
-
-
-def suppress_self_overlap(
-    values: np.ndarray,
-    origin_left: int,
-    origin_top: int,
-    patch_w: int,
-    patch_h: int,
-    fill_value: float,
-    min_overlap_ratio: float = 0.95,
-) -> np.ndarray:
-    masked = values.copy()
-    map_h, map_w = masked.shape
-    if patch_w <= 0 or patch_h <= 0 or map_h == 0 or map_w == 0:
-        return masked
-
-    origin_right = origin_left + patch_w
-    origin_bottom = origin_top + patch_h
-    patch_area = float(patch_w * patch_h)
-
-    xs = np.arange(map_w)
-    ys = np.arange(map_h)
-    overlap_w = np.maximum(
-        0,
-        np.minimum(origin_right, xs + patch_w) - np.maximum(origin_left, xs),
-    )
-    overlap_h = np.maximum(
-        0,
-        np.minimum(origin_bottom, ys + patch_h) - np.maximum(origin_top, ys),
-    )
-    overlap_ratio = np.outer(overlap_h, overlap_w) / patch_area
-    masked[overlap_ratio >= min_overlap_ratio] = fill_value
-    return masked
-
+    patch_w, patch_h = max(1, min(w, patch_w)), max(1, min(h, patch_h))
+    left, top = round((w - patch_w) / 2), round((h - patch_h) / 2)
+    return left, top, left + patch_w, top + patch_h
 
 
 def basic_ncc(first: Image.Image, second: Image.Image) -> float:
@@ -445,22 +242,115 @@ def basic_ncc(first: Image.Image, second: Image.Image) -> float:
     return float(np.clip(np.sum(a * b) / denom, -1.0, 1.0)) if denom > 1e-12 else float("nan")
 
 
-def extend_patch_edges(patch: Image.Image) -> Image.Image:
-    """Copy opposite edges in top/sides/bottom order to exactly double each axis."""
+def extend_patch_edges(image_patch: Image.Image) -> Image.Image:
+    """반대쪽 가장자리를 이어 붙여 가로·세로를 두 배로 확장한다."""
     pixels = np.asarray(patch.convert("RGB"))
     h, w = pixels.shape[:2]
-    pad_x, pad_y = w // 2, h // 2
-    pad_right, pad_bottom = w - pad_x, h - pad_y
-    # Top center: copy the bottom edge of the original patch.
-    top = pixels[np.arange(-pad_y, 0) % h]
-    with_top = np.concatenate((top, pixels), axis=0)
-    # Sides include the new top strip, filling both upper corners.
-    left = with_top[:, np.arange(-pad_x, 0) % w]
-    right = with_top[:, np.arange(pad_right) % w]
-    with_sides = np.concatenate((left, with_top, right), axis=1)
-    # Bottom: copy the original top rows across the full extended width.
-    bottom = with_sides[pad_y + np.arange(pad_bottom) % h]
-    return Image.fromarray(np.concatenate((with_sides, bottom), axis=0))
+    return Image.fromarray(np.pad(
+        pixels, ((h // 2, h - h // 2), (w // 2, w - w // 2), (0, 0)), mode="wrap",
+    ))
+
+
+def draw_ncc_montage(
+    original: Image.Image,
+    patches: List[PatchResult],
+    base_dx: float,
+    base_dy: float,
+    out_path: str,
+) -> None:
+
+    cell_w, cell_h = 630, 260
+    label_h = 58
+    margin = 22
+    title_h = 46
+    original_preview_h = 260
+    section_title_h = 34
+    grid_h = section_title_h + (cell_h + label_h) * 4
+    canvas_w = margin * 2 + cell_w * 4
+    canvas_h = margin * 3 + title_h + original_preview_h + grid_h
+    montage = Image.new("RGB", (canvas_w, canvas_h), (255, 255, 255))
+    draw = ImageDraw.Draw(montage)
+    title_font = safe_font(20)
+    section_font = safe_font(18)
+    label_font = safe_font(12)
+
+    draw.text(
+        (margin, margin),
+        f"NCC patch ranking: dx={base_dx:.1f}px, dy={base_dy:.1f}px",
+        fill=(0, 0, 0),
+        font=title_font,
+    )
+
+    if original is not None:
+        original_preview = original.copy().convert("RGB")
+        original_preview.thumbnail((canvas_w - margin * 2, original_preview_h), Image.Resampling.LANCZOS)
+        original_x = margin + (canvas_w - margin * 2 - original_preview.size[0]) // 2
+        original_y = margin + title_h
+        montage.paste(original_preview, (original_x, original_y))
+        center_x = original_x + original_preview.size[0] // 2
+        center_y = original_y + original_preview.size[1] // 2
+        draw.line([(center_x, original_y), (center_x, original_y + original_preview.size[1])], fill=(255, 0, 0), width=2)
+        draw.line([(original_x, center_y), (original_x + original_preview.size[0], center_y)], fill=(255, 0, 0), width=2)
+        draw.rectangle(
+            [original_x, original_y, original_x + original_preview.size[0], original_y + original_preview.size[1]],
+            outline=(210, 210, 210),
+            width=1,
+        )
+    draw.text((margin, margin + title_h + original_preview_h + 4), "Original image", fill=(0, 0, 0), font=label_font)
+
+    grid_top = margin * 2 + title_h + original_preview_h
+    draw.text((margin, grid_top), "NCC ranking (higher is better)", fill=(0, 0, 0), font=section_font)
+    grid_top += section_title_h
+
+    outer_edges = set()
+    for position, result in enumerate(patches, start=1):
+        image_patch, extended, reference = result.image_patch, result.extended, result.reference
+        row_data = result.metadata
+        dx_mult, dy_mult = row_data["dx_mult"], row_data["dy_mult"]
+        ncc, rank = row_data["ncc_score"], row_data["rank"]
+        col = (position - 1) % 4
+        row = (position - 1) // 4
+        cell_left = margin + col * cell_w
+        cell_top = grid_top + row * (cell_h + label_h)
+        panel_w = cell_w // 3
+        preview_h = cell_h - 28
+        for panel_index, (panel, title) in enumerate(
+            ((image_patch, "Patch"), (extended, "Extended patch"), (reference, "Original crop"))
+        ):
+            panel_left = cell_left + panel_index * panel_w
+            draw.text((panel_left + 8, cell_top + 5), title, fill=(80, 80, 80), font=label_font)
+            if panel is None:
+                message = "out of size"
+                bounds = draw.textbbox((0, 0), message, font=section_font)
+                draw.text((panel_left + (panel_w - bounds[2] + bounds[0]) // 2,
+                           cell_top + cell_h // 2), message, fill=(160, 60, 60), font=section_font)
+            else:
+                preview = panel.copy()
+                preview.thumbnail((panel_w - 16, preview_h), Image.Resampling.LANCZOS)
+                montage.paste(preview, (panel_left + (panel_w - preview.width) // 2,
+                                       cell_top + 22 + (preview_h - preview.height) // 2))
+        right, bottom = cell_left + cell_w, cell_top + cell_h
+        outer_edges.update((
+            (cell_left, cell_top, right, cell_top),
+            (cell_left, bottom, right, bottom),
+            (cell_left, cell_top, cell_left, bottom),
+            (right, cell_top, right, bottom),
+        ))
+        for divider in (1, 2):
+            divider_x = cell_left + divider * panel_w
+            draw.line([(divider_x, cell_top), (divider_x, cell_top + cell_h)], fill=(225, 225, 225), width=1)
+        draw.text(
+            (cell_left + 8, cell_top + cell_h + 5),
+            f"Rank={rank if np.isfinite(ncc) else 'N/A'} dx x{dx_mult}, dy x{dy_mult} ({image_patch.size[0]}x{image_patch.size[1]})",
+            fill=(0, 0, 0),
+            font=label_font,
+        )
+        draw.text((cell_left + 8, cell_top + cell_h + 25), (f"NCC={ncc:.6f}" if np.isfinite(ncc) else "NCC=N/A"), fill=(0, 0, 0), font=label_font)
+
+    # Shared edges have identical coordinates, so each thick border is drawn once.
+    for edge in sorted(outer_edges):
+        draw.line(edge, fill=(40, 40, 40), width=3)
+    montage.save(out_path)
 
 
 def save_period_patches(
@@ -477,74 +367,77 @@ def save_period_patches(
 
     base_dx = abs(x_candidates[0].dx)
     base_dy = abs(y_candidates[0].dy)
-    score_rows = []
-    montage_items: List[Tuple[int, int, Image.Image, Image.Image, Image.Image, Image.Image, float]] = []
-    patch_sizes: List[Tuple[int, int, int, int]] = []
+    results: List[PatchResult] = []
     for dy_mult in range(1, 5):
         for dx_mult in range(1, 5):
             patch_w = int(round(base_dx * dx_mult))
             patch_h = int(round(base_dy * dy_mult))
             left, top, right, bottom = center_patch_box(image, patch_w, patch_h)
-            patch = image.crop((left, top, right, bottom))
+            image_patch = image.crop((left, top, right, bottom))
             # Split odd sizes with the extra pixel on the right/bottom.
-            pad_x, pad_y = patch.width // 2, patch.height // 2
-            pad_right, pad_bottom = patch.width - pad_x, patch.height - pad_y
-            grid_preview = draw_grid_patch_preview(image, base_dx, base_dy, (left, top, right, bottom))
-            extended = extend_patch_edges(patch)
-            patch.save(os.path.join(output_dir, f"period_patch_dx{dx_mult}_dy{dy_mult}.png"))
+            pad_left, pad_top = image_patch.width // 2, image_patch.height // 2
+            pad_right, pad_bottom = image_patch.width - pad_left, image_patch.height - pad_top
+            extended = extend_patch_edges(image_patch)
+            image_patch.save(os.path.join(output_dir, f"period_patch_dx{dx_mult}_dy{dy_mult}.png"))
             # Match the exact source coordinates of the extended patch.
-            box = (left - pad_x, top - pad_y, right + pad_right, bottom + pad_bottom)
+            box = (left - pad_left, top - pad_top, right + pad_right, bottom + pad_bottom)
             fits = box[0] >= 0 and box[1] >= 0 and box[2] <= image.width and box[3] <= image.height
-            reference = image.crop((max(0, box[0]), max(0, box[1]),
-                                    min(image.width, box[2]), min(image.height, box[3])))
+            reference = image.crop(box) if fits else None
             score = basic_ncc(extended, reference) if fits else float("nan")
             status = "ok" if np.isfinite(score) else ("zero_energy" if fits else "outside_image")
-            score_rows.append(dict(dx_mult=dx_mult, dy_mult=dy_mult, patch_width=patch.width,
-                                   patch_height=patch.height, pad_x=pad_x, pad_y=pad_y,
+            metadata = dict(dx_mult=dx_mult, dy_mult=dy_mult, patch_width=image_patch.width,
+                                   patch_height=image_patch.height, pad_left=pad_left, pad_top=pad_top,
                                    pad_right=pad_right, pad_bottom=pad_bottom,
                                    comparison_width=extended.width, comparison_height=extended.height,
-                                   ncc_score=score, status=status, rank=""))
-            montage_items.append((dx_mult, dy_mult, grid_preview, patch, extended, reference, score))
-            patch_sizes.append((dx_mult, dy_mult, patch.size[0], patch.size[1]))
+                                   ncc_score=score, status=status, rank="")
+            results.append(PatchResult(image_patch, extended, reference, metadata))
 
-    ranked = sorted((row for row in score_rows if row["status"] == "ok"),
-                    key=lambda row: row["ncc_score"], reverse=True)
-    for rank, row in enumerate(ranked, start=1):
-        row["rank"] = rank
-        print(f"patch rank={rank} dx={row['dx_mult']} dy={row['dy_mult']} NCC={row['ncc_score']:.6f}")
+    patch_sizes = [(r.metadata["dx_mult"], r.metadata["dy_mult"], r.image_patch.width, r.image_patch.height)
+                   for r in results]
+    results.sort(key=lambda r: (r.reference is not None,
+                 r.metadata["ncc_score"] if np.isfinite(r.metadata["ncc_score"]) else -np.inf), reverse=True)
+    for rank, result in enumerate(results, start=1):
+        row = result.metadata
+        if row["status"] == "ok":
+            row["rank"] = rank
+            print(f"patch rank={rank} dx={row['dx_mult']} dy={row['dy_mult']} NCC={row['ncc_score']:.6f}")
     with open(os.path.join(output_dir, "period_patch_scores.csv"), "w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(score_rows[0]))
+        writer = csv.DictWriter(handle, fieldnames=list(results[0].metadata))
         writer.writeheader()
-        writer.writerows(ranked + [row for row in score_rows if row["status"] != "ok"])
+        writer.writerows(result.metadata for result in results)
     save_patch_box_preview(image, patch_sizes, os.path.join(output_dir, "period_patch_boxes.png"))
-    save_patch_montage(base_dx, base_dy, montage_items, os.path.join(output_dir, "period_patches_16.png"))
+    draw_ncc_montage(image, results, base_dx, base_dy, os.path.join(output_dir, "period_patches_16.png"))
 
 
 def main() -> None:
     # Step 14: CLI entry point. Runs the current axis-separated 1D FFT pipeline end to end.
     parser = argparse.ArgumentParser(description="Show RGB FFT center-to-peak period extraction on the full image.")
     parser.add_argument("--image", required=True, help="Input image path.")
-    parser.add_argument("--output-dir", default="outputs/fft_center_peak_example", help="Output directory.")
+    parser.add_argument("--fft-output-dir", default="output", help="Output directory.")
     parser.add_argument("--patch-output-dir", default="outputs/fft_patch", help="Output directory for period patches.")
-    parser.add_argument("--min-period", type=float, default=10.0, help="Minimum spatial period.")
-    parser.add_argument("--max-period", type=float, default=250.0, help="Maximum spatial period.")
-    parser.add_argument("--max-peaks", type=int, default=20, help="Maximum center-to-peak candidates to keep.")
-    parser.add_argument("--min-peak-percentile", type=float, default=80.0, help="Spectrum local maxima percentile threshold.")
-    parser.add_argument("--dedupe-period-px", type=float, default=4.0, help="Minimum distance between duplicate spatial vectors.")
-    args = parser.parse_args()
+    parser.add_argument("--fft-output-option", default="on", help="Choose whether to save FFT output.")
+    parser.add_argument("--patch-output-option", default="on", help="Choose whether to save patch output.")
+    parser.add_argument("--min-period", type=float, default=MIN_PERIOD, help="Minimum spatial period.")
+    parser.add_argument("--max-period", type=float, default=MAX_PERIOD, help="Maximum spatial period.")
 
-    ensure_dir(args.output_dir)
+
+    args = parser.parse_args()
+    if not (0 < args.min_period <= args.max_period < float("inf")):
+        parser.error("Expected 0 < min-period <= max-period < infinity")
+
+    ensure_dir(args.fft_output_dir)
     # Step 14a: Load input and build the frequency-domain visualization background.
     image, rgb = load_rgb(args.image)
     mag = fft_rgb_log_magnitude(rgb)
-    period_min = args.min_period
-    period_max = args.max_period
+
+    fft_option = args.fft_output_option.lower()
+    patch_option = args.patch_output_option.lower()
 
     # Step 14b: Build 1D FFT axis profiles, then hand only visualization to the draw module.
     ks, amp_x, amp_y, axis_peaks_x, axis_peaks_y = axis_period_profiles(
         rgb,
-        min_period=period_min,
-        max_period=period_max,
+        min_period=args.min_period,
+        max_period=args.max_period,
     )
     save_axis_period_functions(
         ks,
@@ -552,38 +445,41 @@ def main() -> None:
         amp_y,
         axis_peaks_x,
         axis_peaks_y,
-        os.path.join(args.output_dir, "axis_period_functions.png"),
+        os.path.join(args.fft_output_dir, "axis_period_functions.png"),
         os.path.basename(args.image),
     )
 
     # Step 14c: Convert axis peaks into final candidates.
     candidates = candidates_from_axis_period_peaks(
-        mag,
-        axis_peaks_x,
-        axis_peaks_y,
-        max_candidates=min(args.max_peaks, 2),
+        rgb.shape[:2], axis_peaks_x, axis_peaks_y,
     )
     visual_limit = 2
 
 
     # Step 14d: Write all visual and tabular outputs.
-    draw_frequency_domain_peaks(
-        mag,
-        candidates,
-        os.path.join(args.output_dir, "frequency_domain_peaks.png"),
-        visual_limit=visual_limit,
-    )
-    draw_spatial_domain_peaks(
-        image,
-        candidates,
-        os.path.join(args.output_dir, "spatial_domain_peaks.png"),
-        visual_limit=visual_limit,
-    )
-    save_period_patches(image, candidates, args.patch_output_dir)
+    if fft_option == "off":
+        print("FFT output is disabled. Skipping FFT visualizations.")
+    else:
+        draw_frequency_domain_peaks(
+            mag,
+            candidates,
+            os.path.join(args.fft_output_dir, "frequency_domain_peaks.png"),
+            visual_limit=visual_limit,
+        )
+        draw_spatial_domain_peaks(
+            image,
+            candidates,
+            os.path.join(args.fft_output_dir, "spatial_domain_peaks.png"),
+            visual_limit=visual_limit,
+        )
+    if patch_option == "off":
+        print("Patch output is disabled. Skipping patch generation.")
+    else:
+        save_period_patches(image, candidates, args.patch_output_dir)
 
-    print(f"output_dir: {args.output_dir}")
+    print(f"fft_output_dir: {args.fft_output_dir}")
     print(f"image_size: width={image.size[0]}, height={image.size[1]}")
-    print(f"spectrum_peaks_found: {len(candidates)}")
+
     for idx, peak in enumerate(axis_peaks_x, start=1):
         print(f"axis_x_peak_#{idx}: k={peak.k:.1f} period={peak.period_px:.1f}px amplitude={peak.amplitude:.3f}")
     for idx, peak in enumerate(axis_peaks_y, start=1):
