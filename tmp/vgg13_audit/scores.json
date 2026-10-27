@@ -1,0 +1,40 @@
+{
+  "1": {
+    "patch_size": [
+      86,
+      17
+    ],
+    "box": [
+      469,
+      504,
+      555,
+      521
+    ],
+    "mask_pixels": 65426,
+    "production_score": 0.3810654878616333,
+    "independent_numpy_score": 0.38106548552245617,
+    "full_image_score": 0.3817478812338748,
+    "first10_score": 0.35025280714035034,
+    "common_mask_score": 0.3803885877132416,
+    "extra_ring_score": 0.6040669083595276
+  },
+  "3": {
+    "patch_size": [
+      86,
+      50
+    ],
+    "box": [
+      469,
+      487,
+      555,
+      537
+    ],
+    "mask_pixels": 65228,
+    "production_score": 0.46361398696899414,
+    "independent_numpy_score": 0.4636140060482992,
+    "full_image_score": 0.46561085682063597,
+    "first10_score": 0.43751761317253113,
+    "common_mask_score": 0.46361398696899414,
+    "extra_ring_score": 0.8427523374557495
+  }
+}

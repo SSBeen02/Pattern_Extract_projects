@@ -301,6 +301,36 @@ def opencv_ncc(first: Image.Image, second: Image.Image, mask: np.ndarray = None)
     return float(np.clip(num / denom, -1.0, 1.0)) if denom > 1e-12 else float("nan")
 
 
+def boundary_continuity_score(extended: Image.Image, reference: Image.Image,
+                              patch_size: Tuple[int, int], extra_w: int,
+                              extra_h: int) -> float:
+    """Compare RGB jumps at four patch/margin joins against the real image.
+
+    Average absolute gradient errors per edge, then give the available edges
+    equal weight. RGB gradients lie in [-1, 1], so divide error by two to
+    produce a continuity score in [0, 1]. Natural source edges are not penalized.
+    """
+    if extended.size != reference.size:
+        raise ValueError("Continuity inputs must have the same size")
+    pw, ph = patch_size
+    left, top = extra_w // 2, extra_h // 2
+    right, bottom = left + pw, top + ph
+    a = np.asarray(extended.convert("RGB"), dtype=np.float64) / 255.0
+    b = np.asarray(reference.convert("RGB"), dtype=np.float64) / 255.0
+    errors = []
+    for x in (left, right):
+        if 0 < x < a.shape[1]:
+            delta_a = a[top:bottom, x] - a[top:bottom, x - 1]
+            delta_b = b[top:bottom, x] - b[top:bottom, x - 1]
+            errors.append(float(np.abs(delta_a - delta_b).mean()))
+    for y in (top, bottom):
+        if 0 < y < a.shape[0]:
+            delta_a = a[y, left:right] - a[y - 1, left:right]
+            delta_b = b[y, left:right] - b[y - 1, left:right]
+            errors.append(float(np.abs(delta_a - delta_b).mean()))
+    return float(np.clip(1.0 - np.mean(errors) / 2.0, 0.0, 1.0)) if errors else float("nan")
+
+
 @lru_cache(maxsize=1)
 def _vgg19_conv2_2_model():
     from torchvision import models
@@ -312,7 +342,11 @@ def extract_vgg19_features(image: Image.Image) -> dict:
     import torch
     from torchvision import transforms
     with torch.no_grad():
-        tensor = transforms.ToTensor()(image.convert("RGB")).unsqueeze(0)
+        tensor = transforms.ToTensor()(image.convert("RGB"))
+        tensor = transforms.Normalize(
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225],
+        )(tensor).unsqueeze(0)
         return {"conv2_2": _vgg19_conv2_2_model()(tensor)}
 
 
@@ -331,37 +365,30 @@ def tile_patch_to_image(patch: Image.Image, image_size: Tuple[int, int],
     return Image.fromarray(pixels[ys[:, None], xs[None, :]])
 
 
-def vgg19(image: Image.Image, output_dir: str) -> dict:
-    import torch
+def save_vgg19_feature_maps(feature_maps: dict, output_path: str) -> None:
+    """Save the first ten channels of each extracted layer without another inference."""
     import matplotlib.pyplot as plt
-    from torchvision import models, transforms
 
-    # 1. 저장 폴더 생성
-    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    fig, axes = plt.subplots(len(feature_maps), 10,
+                             figsize=(16, 2.5 * len(feature_maps)), squeeze=False)
+    try:
+        for row, (name, fmap) in enumerate(feature_maps.items()):
+            channels = fmap.detach().squeeze(0).cpu().numpy()
+            for col in range(10):
+                if col < len(channels):
+                    axes[row, col].imshow(channels[col], cmap="gray")
+                axes[row, col].axis("off")
+            axes[row, 0].set_title(name)
+        fig.tight_layout()
+        fig.savefig(output_path, dpi=200)
+    finally:
+        plt.close(fig)
 
+
+def vgg19(image: Image.Image, output_dir: str) -> dict:
     feature_maps = extract_vgg19_features(image)
-
-    # 6. Feature Map 크기 출력
-    for name, fmap in feature_maps.items():
-        print(name, fmap.shape)
-
-    # # 7. 시각화
-    # fig, axes = plt.subplots(4, 8, figsize=(16, 8))
-    # for row, (name, fmap) in enumerate(feature_maps.items()):
-    #     channels = fmap.squeeze(0).cpu().numpy()
-    #     for col in range(8):
-    #         axes[row, col].imshow(channels[col], cmap="gray")
-    #         axes[row, col].axis("off")
-    #     axes[row, 0].set_title(name)
-    # plt.tight_layout()
-
-    # # 8. 시각화 이미지 저장
-    # image_path = os.path.join(output_dir, "feature_maps.png")
-    # plt.savefig(image_path, dpi=200)
-
-    # # 9. Feature Map Tensor 저장
-    # tensor_path = os.path.join(output_dir, "feature_maps.pt")
-    # torch.save(feature_maps, tensor_path)
+    save_vgg19_feature_maps(feature_maps, os.path.join(output_dir, "original_feature_maps.png"))
     return feature_maps
 
 
@@ -384,17 +411,23 @@ def vgg19_comparison_mask(image_size, feature_shape, patch_box) -> np.ndarray:
 
 def vgg19_score(feature_maps: dict, patch: Image.Image, image: Image.Image,
                 patch_box: Tuple[int, int, int, int],
-                tiled: Image.Image | None = None) -> float:
+                tiled: Image.Image | None = None,
+                feature_output_path: str | None = None) -> float:
     """Mean spatial feature cosine outside the central patch; higher is better."""
     import torch
     if tiled is None:
         tiled = tile_patch_to_image(patch, image.size, patch_box)
     original_features = feature_maps["conv2_2"]
     mask = vgg19_comparison_mask(image.size, original_features.shape[2:], patch_box)
-    if not mask.any():
+    if not mask.any() and feature_output_path is None:
         return float("nan")
     with torch.no_grad():
-        tiled_features = extract_vgg19_features(tiled)["conv2_2"]
+        tiled_maps = extract_vgg19_features(tiled)
+        if feature_output_path is not None:
+            save_vgg19_feature_maps(tiled_maps, feature_output_path)
+        if not mask.any():
+            return float("nan")
+        tiled_features = tiled_maps["conv2_2"]
         if original_features.shape != tiled_features.shape:
             raise ValueError("Original and tiled conv2_2 shapes must match")
         selected = torch.as_tensor(mask, device=tiled_features.device)
@@ -417,6 +450,7 @@ def create_period_patches(
     candidates: List[FftPeakCandidate],
     score_method: str = "ncc",
     feature_maps: dict | None = None,
+    feature_output_dir: str | None = None,
 ) -> List[PatchResult]:
     # Step 12c: Make 16 center patches from 1x..4x of the detected x/y periods.
     if score_method not in ("ncc", "vgg19"):
@@ -464,7 +498,10 @@ def create_period_patches(
             if score_method == "vgg19":
                 tiled = tile_patch_to_image(image_patch, image.size, (left, top, right, bottom))
                 score = vgg19_score(feature_maps, image_patch, image,
-                                    (left, top, right, bottom), tiled)
+                                    (left, top, right, bottom), tiled,
+                                    feature_output_path=(os.path.join(
+                                        feature_output_dir, f"tiled_feature_map_dx{dx_mult}_dy{dy_mult}.png")
+                                        if feature_output_dir is not None else None))
                 status = "ok" if np.isfinite(score) else "no_comparison_signal"
             else:
                 score = (opencv_ncc(extended, reference, margin_mask)
@@ -475,10 +512,19 @@ def create_period_patches(
                                    comparison_width=extended.width, comparison_height=extended.height,
                                    score_method=score_method, status=status, rank="")
             metadata[score_key] = score
+            if score_method == "ncc":
+                continuity = (boundary_continuity_score(
+                    extended, reference, image_patch.size, extra_w, extra_h)
+                    if reference is not None else float("nan"))
+                metadata["continuity_score"] = continuity
+                metadata["final_score"] = 0.6 * score + 0.4 * continuity
+                if not np.isfinite(metadata["final_score"]) and status == "ok":
+                    metadata["status"] = "no_boundary_signal"
             if score_method == "vgg19":
                 metadata.update(comparison_width=w, comparison_height=h, score_metric="spatial_feature_cosine_similarity")
             results.append(PatchResult(image_patch, extended, reference, metadata, tiled))
 
+    score_key = "final_score" if score_method == "ncc" else score_key
     results.sort(key=lambda r: (
         not np.isfinite(r.metadata[score_key]),
         -r.metadata[score_key]
@@ -493,11 +539,13 @@ def create_period_patches(
     return results
 
 
-def select_final_periods(image, vote_x, vote_y, score_method="ncc", feature_maps=None):
+def select_final_periods(image, vote_x, vote_y, score_method="ncc", feature_maps=None,
+                         feature_output_dir=None):
     """Keep each axis vote winner regardless of subsequent patch scores."""
     candidates = candidates_from_axis_period_peaks(
         (image.height, image.width), vote_x.peaks, vote_y.peaks)
-    results = create_period_patches(image, candidates, score_method, feature_maps)
+    results = create_period_patches(image, candidates, score_method, feature_maps,
+                                    feature_output_dir)
     return (vote_x.amplitude, vote_y.amplitude, vote_x.peaks, vote_y.peaks,
             candidates, results)
 
@@ -532,7 +580,7 @@ def main() -> None:
     ks, amp_x, amp_y, axis_peaks_x, axis_peaks_y, vote_x, vote_y = axis_period_profiles(
         rgb, include_votes=True)
     amp_x, amp_y, axis_peaks_x, axis_peaks_y, candidates, results = select_final_periods(
-        image, vote_x, vote_y, args.score_method, feature_maps)
+        image, vote_x, vote_y, args.score_method, feature_maps, args.output_dir)
     save_axis_period_functions(
         ks,
         amp_x,

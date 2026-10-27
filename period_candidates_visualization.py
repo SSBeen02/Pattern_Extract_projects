@@ -339,7 +339,6 @@ def draw_spatial_domain_peaks(
 
     vis.save(out_path)
 
-
 def _draw_score_montage(
     original: Image.Image,
     patches: List[Any],
@@ -349,122 +348,273 @@ def _draw_score_montage(
     score_method: str,
 ) -> None:
     score_label = score_method.upper()
-    # 캔버스 크기와 비율은 기존 4열×4행 레이아웃의 크기를 유지한다.
+
     cell_w, cell_h = 630, 260
     label_h = 58
     margin = 30
     title_h = 46
-    canvas_original_slot_h = 260  # 기존 전체 캔버스 크기와 비율을 유지하기 위한 레이아웃 기준 높이
-    original_preview_h = 520  # 실제 원본 미리보기는 기존 표시 크기의 2배
+    canvas_original_slot_h = 260
+    original_preview_h = 520
     section_title_h = 34
     grid_h = section_title_h + (cell_h + label_h) * 4
     canvas_w = margin * 2 + cell_w * 4
-    canvas_h = margin * 3 + title_h + canvas_original_slot_h + grid_h
-    montage = Image.new("RGB", (canvas_w, canvas_h), (255, 255, 255))
+    canvas_h = (
+        margin * 3
+        + title_h
+        + canvas_original_slot_h
+        + grid_h
+    )
+
+    montage = Image.new(
+        "RGB", (canvas_w, canvas_h), (255, 255, 255)
+    )
     draw = ImageDraw.Draw(montage)
     title_font = safe_font(40)
     section_font = safe_font(32)
     label_font = safe_font(36)
 
-    title = f"{score_label} patch comparison: dx={base_dx:.1f}px, dy={base_dy:.1f}px"
+    title = (
+        f"{score_label} patch comparison: "
+        f"dx={base_dx:.1f}px, dy={base_dy:.1f}px"
+    )
+    if score_method == "vgg19" and patches and patches[0].metadata.get("rank_small", False):
+        title += " | smaller first"
     title_box = draw.textbbox((0, 0), title, font=title_font)
     title_y = margin
-    draw.text((margin, title_y), title, fill=(0, 0, 0), font=title_font)
+    draw.text(
+        (margin, title_y),
+        title,
+        fill=(0, 0, 0),
+        font=title_font,
+    )
 
-    # 한 개 몽타주의 NCC 설명과 Rank 정보를 좌측 상단에 제목 아래로 이어서 표시한다.
     result = patches[0] if patches else None
+
     if result is not None:
         row_data = result.metadata
-        dx_mult, dy_mult = row_data["dx_mult"], row_data["dy_mult"]
-        score, rank = row_data[f"{score_method}_score"], row_data["rank"]
+        dx_mult = row_data["dx_mult"]
+        dy_mult = row_data["dy_mult"]
+        score = row_data[f"{score_method}_score"]
+        rank = row_data["rank"]
         image_patch = result.image_patch
-        
-        comparison_title = ("VGG19 feature comparison"
-                            if score_method == "vgg19" else "NCC similarity on the extended margin")
-        comparison_title_box = draw.textbbox((0, 0), comparison_title, font=section_font)
-        comparison_y = title_y + (title_box[3] - title_box[1]) + 30
-        draw.text((margin, comparison_y), comparison_title, fill=(0, 0, 0), font=section_font)
 
-        info = (f"Rank={rank if np.isfinite(score) else 'N/A'}  |  "
-                f"dx x{dx_mult}, dy x{dy_mult}  |  "
-                f"Patch={image_patch.width}x{image_patch.height}  |  "
-                f"{score_label}={score:.6f}" if np.isfinite(score) else
-                f"Rank=N/A  |  dx x{dx_mult}, dy x{dy_mult}  |  "
-                f"Patch={image_patch.width}x{image_patch.height}  |  {score_label}=N/A")
+        comparison_title = (
+            "VGG19 feature comparison"
+            if score_method == "vgg19"
+            else "NCC similarity on the extended margin"
+        )
+        comparison_title_box = draw.textbbox(
+            (0, 0), comparison_title, font=section_font
+        )
+        comparison_y = (
+            title_y + (title_box[3] - title_box[1]) + 30
+        )
+        draw.text(
+            (margin, comparison_y),
+            comparison_title,
+            fill=(0, 0, 0),
+            font=section_font,
+        )
+
+        score_text = f"{score:.6f}" if np.isfinite(score) else "N/A"
+        rank_text = rank if np.isfinite(score) else "N/A"
+        info = (
+            f"Rank={rank_text}  |  "
+            f"dx x{dx_mult}, dy x{dy_mult}  |  "
+            f"Patch={image_patch.width}x{image_patch.height}  |  "
+            f"{score_label}={score_text}"
+        )
+
         info_box = draw.textbbox((0, 0), info, font=label_font)
-        info_y = comparison_y + (comparison_title_box[3] - comparison_title_box[1]) + 40
-        draw.text((margin, info_y), info, fill=(0, 0, 0), font=label_font)
+        info_y = (
+            comparison_y
+            + (comparison_title_box[3] - comparison_title_box[1])
+            + 40
+        )
+        draw.text(
+            (margin, info_y),
+            info,
+            fill=(0, 0, 0),
+            font=label_font,
+        )
         header_bottom = info_y + (info_box[3] - info_box[1])
+        if score_method == "ncc" and "continuity_score" in row_data:
+            def score_text_value(value):
+                return f"{value:.6f}" if np.isfinite(value) else "N/A"
+            detail = (
+                f"Continuity score={score_text_value(row_data['continuity_score'])}  |  "
+                f"Final score={score_text_value(row_data['final_score'])} "
+                "(0.6 x NCC + 0.4 x Continuity)"
+            )
+            detail_y = header_bottom + 18
+            draw.text((margin, detail_y), detail, fill=(0, 0, 0), font=section_font)
+            detail_box = draw.textbbox((0, 0), detail, font=section_font)
+            header_bottom = detail_y + detail_box[3] - detail_box[1]
     else:
         header_bottom = title_y + (title_box[3] - title_box[1])
 
-    # 원본 이미지는 상단 중앙에 두되, 왼쪽의 세 줄 텍스트 아래에서 시작하게 한다.
     original_y = max(margin + title_h, header_bottom + 16)
+    original_display_h = 0
+
     if original is not None:
         original_preview = original.copy().convert("RGB")
-        original_preview.thumbnail((canvas_w - margin * 2, original_preview_h), Image.Resampling.LANCZOS)
+        original_preview.thumbnail(
+            (canvas_w - margin * 2, original_preview_h),
+            Image.Resampling.LANCZOS,
+        )
+        original_display_h = original_preview.height
         original_x = (canvas_w - original_preview.width) // 2
         montage.paste(original_preview, (original_x, original_y))
+
         center_x = original_x + original_preview.width // 2
         center_y = original_y + original_preview.height // 2
-        draw.line([(center_x, original_y), (center_x, original_y + original_preview.height)], fill=(255, 0, 0), width=2)
-        draw.line([(original_x, center_y), (original_x + original_preview.width, center_y)], fill=(255, 0, 0), width=2)
+
+        draw.line(
+            [
+                (center_x, original_y),
+                (center_x, original_y + original_preview.height),
+            ],
+            fill=(255, 0, 0),
+            width=2,
+        )
+        draw.line(
+            [
+                (original_x, center_y),
+                (original_x + original_preview.width, center_y),
+            ],
+            fill=(255, 0, 0),
+            width=2,
+        )
         draw.rectangle(
-            [original_x, original_y, original_x + original_preview.width, original_y + original_preview.height],
+            [
+                original_x,
+                original_y,
+                original_x + original_preview.width,
+                original_y + original_preview.height,
+            ],
             outline=(210, 210, 210),
             width=1,
         )
+
         original_label = "Original image"
-        label_box = draw.textbbox((0, 0), original_label, font=label_font)
-        draw.text(((canvas_w - (label_box[2] - label_box[0])) // 2,
-                   original_y + original_preview.height + 4), original_label, fill=(0, 0, 0), font=label_font)
+        label_box = draw.textbbox(
+            (0, 0), original_label, font=label_font
+        )
+        draw.text(
+            (
+                (canvas_w - (label_box[2] - label_box[0])) // 2,
+                original_y + original_preview.height + 4,
+            ),
+            original_label,
+            fill=(0, 0, 0),
+            font=label_font,
+        )
 
-    # 세 비교 이미지는 원본 이미지 아래에 가로 한 줄로 배치한다.
     if result is not None:
-        image_patch, extended, reference = result.image_patch, result.extended, result.reference
-
         panel_gap = 24
         panel_margin = 60
-        panel_w = (canvas_w - panel_margin * 2 - panel_gap * 2) // 3
-        panel_lefts = [panel_margin + i * (panel_w + panel_gap) for i in range(3)]
-        panel_top = original_y + (original_preview.height if original is not None else 0) + 72
+        panel_w = (
+            canvas_w - panel_margin * 2 - panel_gap * 2
+        ) // 3
+        panel_lefts = [
+            panel_margin + i * (panel_w + panel_gap)
+            for i in range(3)
+        ]
+        panel_top = original_y + original_display_h + 72
         image_top = panel_top + 100
         image_h = canvas_h - image_top - 150
         preview_w = panel_w - 24
 
-        panels = (
-            (image_patch, "Patch"),
-            (extended, "Extended patch"),
-            (reference, "Original crop"),
-        )
-        for panel_left, (panel, panel_title) in zip(panel_lefts, panels):
-            title_box = draw.textbbox((0, 0), panel_title, font=label_font)
-            draw.text((panel_left + (panel_w - (title_box[2] - title_box[0])) // 2, panel_top + 50),
-                      panel_title, fill=(60, 60, 60), font=label_font)
+        # VGG: 패치 / 전체 타일링 이미지 / 원본 전체 이미지
+        # NCC: 패치 / 확장 패치 / 원본 crop
+        if score_method == "vgg19":
+            if result.tiled is None:
+                raise ValueError(
+                    "VGG montage requires result.tiled"
+                )
+            panels = (
+                (result.image_patch, "Patch"),
+                (result.tiled, "Tiled image"),
+                (original, "Original image"),
+            )
+        else:
+            panels = (
+                (result.image_patch, "Patch"),
+                (result.extended, "Extended patch"),
+                (result.reference, "Original crop"),
+            )
+
+        for panel_left, (panel, panel_title) in zip(
+            panel_lefts, panels
+        ):
+            panel_title_box = draw.textbbox(
+                (0, 0), panel_title, font=label_font
+            )
+            draw.text(
+                (
+                    panel_left
+                    + (
+                        panel_w
+                        - (panel_title_box[2] - panel_title_box[0])
+                    ) // 2,
+                    panel_top + 50,
+                ),
+                panel_title,
+                fill=(60, 60, 60),
+                font=label_font,
+            )
+
             box_top = image_top + 28
             box_bottom = box_top + image_h
-            draw.rectangle([panel_left, box_top, panel_left + panel_w, box_bottom],
-                           outline=(180, 180, 180), width=1)
+            draw.rectangle(
+                [
+                    panel_left,
+                    box_top,
+                    panel_left + panel_w,
+                    box_bottom,
+                ],
+                outline=(180, 180, 180),
+                width=1,
+            )
+
             if panel is None:
                 message = "out of size"
-                bounds = draw.textbbox((0, 0), message, font=section_font)
-                draw.text((panel_left + (panel_w - bounds[2] + bounds[0]) // 2,
-                           box_top + (image_h - (bounds[3] - bounds[1])) // 2),
-                          message, fill=(160, 60, 60), font=section_font)
+                bounds = draw.textbbox(
+                    (0, 0), message, font=section_font
+                )
+                draw.text(
+                    (
+                        panel_left
+                        + (panel_w - bounds[2] + bounds[0]) // 2,
+                        box_top
+                        + (image_h - (bounds[3] - bounds[1])) // 2,
+                    ),
+                    message,
+                    fill=(160, 60, 60),
+                    font=section_font,
+                )
             else:
                 preview = panel.copy().convert("RGB")
-                # thumbnail()은 원본보다 확대하지 않으므로, 패널을 채우도록 비율을 유지해 직접 리사이즈한다.
-                scale = min(preview_w / preview.width, (image_h - 16) / preview.height)
+                scale = min(
+                    preview_w / preview.width,
+                    (image_h - 16) / preview.height,
+                )
                 preview = preview.resize(
-                    (max(1, round(preview.width * scale)), max(1, round(preview.height * scale))),
+                    (
+                        max(1, round(preview.width * scale)),
+                        max(1, round(preview.height * scale)),
+                    ),
                     Image.Resampling.LANCZOS,
                 )
-                paste_x = panel_left + (panel_w - preview.width) // 2
-                paste_y = box_top + (image_h - preview.height) // 2
+                paste_x = (
+                    panel_left + (panel_w - preview.width) // 2
+                )
+                paste_y = (
+                    box_top + (image_h - preview.height) // 2
+                )
                 montage.paste(preview, (paste_x, paste_y))
 
     montage.save(out_path)
-
 
 def draw_ncc_montage(original, patches, base_dx, base_dy, out_path) -> None:
     """Render precomputed NCC scores."""
