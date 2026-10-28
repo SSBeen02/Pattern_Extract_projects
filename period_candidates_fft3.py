@@ -9,6 +9,7 @@ from typing import List, Tuple
 
 import numpy as np  
 from PIL import Image
+from period_output_naming import image_id, save_ranked_patches
 
 from period_candidates_visualization import (
     format_truncated,
@@ -17,13 +18,13 @@ from period_candidates_visualization import (
     save_axis_period_functions,
     save_period_patches,
 )
-
+''' ncc or vgg: conv4_4 or dense 선택'''
 #cosine 
 AXIS_PROFILE_MAX_K = 100
 AXIS_PEAK_RELATIVE_THRESHOLD = 0.5
 min_period = 1024.0 / 100.0
 max_period = 1024.0 / 3.0
-
+alpha = 0.1
 
 @dataclass
 class AxisPeriodPeak:
@@ -196,28 +197,28 @@ def select_axis_amplitude_peaks(
     axis: str, ks: np.ndarray, amplitude: np.ndarray,
     valid: np.ndarray, image_size: int,
 ) -> List[AxisPeriodPeak]:
-    """유효 최댓값의 threshold 이상인 peaks 모두."""
-    indices = np.flatnonzero(valid)
+    """Select the farthest local peak passing an origin-based threshold."""
+    indices = np.flatnonzero(valid & np.isfinite(ks) & (ks > 0))
     if indices.size == 0:
         return []
     if not np.any(np.isfinite(amplitude[indices]) & (amplitude[indices] > 0)):
         return []
-    peak_index = []
-    threshold = AXIS_PEAK_RELATIVE_THRESHOLD * float(np.max(amplitude[indices]))
-    max_r = 0.0
-    final_index = -1
-    for index in sorted(indices, key=lambda i: float(ks[i])):
+    finite_indices = indices[np.isfinite(amplitude[indices])]
+    strongest = max(finite_indices, key=lambda i: float(amplitude[i]))
+    max_amplitude = float(amplitude[strongest])
+
+    peak_indices = []
+
+    for index in indices:
+        k = float(ks[index])
+        if k <= 0:
+            continue
+        threshold = max_amplitude / (k ** alpha)
         left = amplitude[index - 1] if index > 0 else -np.inf
         right = amplitude[index + 1] if index < amplitude.size - 1 else -np.inf
-        if amplitude[index] >= threshold and amplitude[index] >= max(left, right):
-            peak_index.append(index)
-    for index in peak_index:
-        h = amplitude[index]
-        w = ks[index]
-        r = float(np.sqrt(h**2 + w**2))
-        if r > max_r:
-            max_r = r
-            final_index = index
+        if np.isfinite(amplitude[index]) and amplitude[index] >= threshold and amplitude[index] >= max(left, right):
+            peak_indices.append(index)
+    final_index = max(peak_indices, key=lambda i: float(ks[i]), default=-1)
 
     if final_index < 0:
         return []
@@ -301,32 +302,30 @@ def opencv_ncc(first: Image.Image, second: Image.Image, mask: np.ndarray = None)
     return float(np.clip(num / denom, -1.0, 1.0)) if denom > 1e-12 else float("nan")
 
 
-# Previous conv2_2-only extractor, retained for a future multi-layer comparison.
-# @lru_cache(maxsize=1)
-# def _vgg19_conv2_2_model():
-#     from torchvision import models
-#     return models.vgg19(weights=models.VGG19_Weights.DEFAULT).features[:9].eval()
-
-
 @lru_cache(maxsize=1)
-def _vgg19_conv3_4_model():
+def _vgg19_dense_model():
     from torchvision import models
-    # Includes conv3_4 (index 16) and its ReLU (index 17), before pool3.
-    # Reuse the same pretrained model for the original and all tiled candidates.
-    return models.vgg19(weights=models.VGG19_Weights.DEFAULT).features[:18].eval()
+    # Full forward returns classifier[6] logits, before softmax.
+    return models.vgg19(weights=models.VGG19_Weights.DEFAULT).eval()
 
 
-def extract_vgg19_features(image: Image.Image) -> dict:
+def extract_vgg19_features(image: Image.Image, feature_mode: str = "dense") -> dict:
+    """Extract final logits or conv4_4 activations without saving feature images."""
     import torch
     from torchvision import transforms
+    if feature_mode not in ("conv", "dense"):
+        raise ValueError("feature_mode must be conv or dense")
     with torch.no_grad():
-        tensor = transforms.ToTensor()(image.convert("RGB"))
-        tensor = transforms.Normalize(
-            mean=[0.485, 0.456, 0.406],
-            std=[0.229, 0.224, 0.225],
-        )(tensor).unsqueeze(0)
-        # return {"conv2_2": _vgg19_conv2_2_model()(tensor)}
-        return {"conv3_4": _vgg19_conv3_4_model()(tensor)}
+        preprocessing = ([transforms.Resize((224, 224))] if feature_mode == "dense" else [])
+        tensor = transforms.Compose(preprocessing + [
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])(image.convert("RGB")).unsqueeze(0)
+        model = _vgg19_dense_model()
+        if feature_mode == "conv":
+            # features[25] is conv4_4; features[26] is its ReLU, before pool4.
+            return {"conv4_4": model.features[:27](tensor)}
+        return {"dense_final": model(tensor)}
 
 
 def tile_patch_to_image(patch: Image.Image, image_size: Tuple[int, int],
@@ -344,69 +343,14 @@ def tile_patch_to_image(patch: Image.Image, image_size: Tuple[int, int],
     return Image.fromarray(pixels[ys[:, None], xs[None, :]])
 
 
-def save_vgg19_feature_maps(feature_maps: dict, output_path: str) -> None:
-    """Save the first ten channels of each extracted layer without another inference."""
-    import matplotlib.pyplot as plt
-
-    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-    fig, axes = plt.subplots(len(feature_maps), 10,
-                             figsize=(16, 2.5 * len(feature_maps)), squeeze=False)
-    try:
-        for row, (name, fmap) in enumerate(feature_maps.items()):
-            channels = fmap.detach().squeeze(0).cpu().numpy()
-            for col in range(10):
-                if col < len(channels):
-                    axes[row, col].imshow(channels[col], cmap="gray")
-                axes[row, col].axis("off")
-            axes[row, 0].set_title(name)
-        fig.tight_layout()
-        fig.savefig(output_path, dpi=200)
-    finally:
-        plt.close(fig)
-
-
-def vgg19(image: Image.Image, output_dir: str) -> dict:
-    feature_maps = extract_vgg19_features(image)
-    save_vgg19_feature_maps(feature_maps, os.path.join(output_dir, "original_feature_maps.png"))
-    return feature_maps
-
-
-def vgg19_comparison_mask(image_size, feature_shape, patch_box) -> np.ndarray:
-    """Exclude this candidate's central source patch in feature coordinates."""
-    width, height = image_size
-    fh, fw = feature_shape
-    left, top, right, bottom = patch_box
-    if not (0 <= left < right <= width and 0 <= top < bottom <= height):
-        raise ValueError("Patch box must be inside original image")
-    if fh <= 0 or fw <= 0:
-        raise ValueError("Feature dimensions must be positive")
-    mask = np.ones((fh, fw), dtype=bool)
-    mask[math.floor(top * fh / height):math.ceil(bottom * fh / height),
-         math.floor(left * fw / width):math.ceil(right * fw / width)] = False
-    return mask
-
-
 def rank_period_patches(results, score_method, rank_small=False):
-    """Prioritize small scales only within threshold of the single global best score."""
+    """Descending score only; rank_small is an ignored compatibility argument."""
     key = f"{score_method}_score"
-    finite = [r.metadata[key] for r in results if np.isfinite(r.metadata[key])]
-    best = max(finite) if finite else float("nan")
-    mini = min(finite) if finite else float("nan")
-    smaller_first = rank_small and score_method == "vgg19"
-
-    def order(result):
-        row = result.metadata
-        score = row[key]
-        if not np.isfinite(score):
-            return (2, 0, 0)
-        if smaller_first and best - score <= (best-mini)*0.6:
-            return (0, row["dx_mult"] * row["dy_mult"], -score)
-        return (1, -score, 0)
-
-    results.sort(key=order)
+    results.sort(key=lambda r: (not np.isfinite(r.metadata[key]),
+                               -r.metadata[key] if np.isfinite(r.metadata[key]) else 0))
     for rank, result in enumerate(results, start=1):
         row = result.metadata
-        row["rank_small"] = smaller_first
+        row["rank_small"] = False
         row["rank"] = rank if row["status"] == "ok" and np.isfinite(row[key]) else ""
     return results
 
@@ -414,43 +358,46 @@ def rank_period_patches(results, score_method, rank_small=False):
 def vgg19_score(feature_maps: dict, patch: Image.Image, image: Image.Image,
                 patch_box: Tuple[int, int, int, int],
                 tiled: Image.Image | None = None,
-                feature_output_path: str | None = None,
-                comparison_mask: np.ndarray | None = None) -> float:
-    """Mean spatial feature cosine outside the central patch; higher is better."""
+                feature_mode: str = "dense") -> float:
+    """Dense cosine or mean per-position conv cosine, without spatial masking."""
     import torch
     if tiled is None:
         tiled = tile_patch_to_image(patch, image.size, patch_box)
-    # original_features = feature_maps["conv2_2"]
-    original_features = feature_maps["conv3_4"]
-    mask = (vgg19_comparison_mask(image.size, original_features.shape[2:], patch_box)
-            if comparison_mask is None else comparison_mask)
-    if mask.shape != tuple(original_features.shape[2:]) or mask.dtype != np.bool_:
-        raise ValueError("Comparison mask must be boolean and match the feature shape")
-    if not mask.any() and feature_output_path is None:
-        return float("nan")
     with torch.no_grad():
-        tiled_maps = extract_vgg19_features(tiled)
-        if feature_output_path is not None:
-            save_vgg19_feature_maps(tiled_maps, feature_output_path)
-        if not mask.any():
+        tiled_maps = extract_vgg19_features(tiled, feature_mode)
+        key = "conv4_4" if feature_mode == "conv" else "dense_final"
+        original, candidate = feature_maps[key], tiled_maps[key]
+        if original.shape != candidate.shape:
+            raise ValueError("Original and tiled feature shapes must match")
+        if original.norm().item() == 0 or candidate.norm().item() == 0:
             return float("nan")
-        # tiled_features = tiled_maps["conv2_2"]
-        tiled_features = tiled_maps["conv3_4"]
-        if original_features.shape != tiled_features.shape:
-            raise ValueError("Original and tiled conv3_4 shapes must match")
-        selected = torch.as_tensor(mask, device=tiled_features.device)
-        original = original_features.to(tiled_features.device)[0, :, selected]
-        candidate = tiled_features[0, :, selected]
-        # Keep the existing exclusion of channels with no response in either image.
-        active = torch.any(original != 0, dim=1) | torch.any(candidate != 0, dim=1)
-        if not torch.any(active):
-            return float("nan")
-        original = original[active]
-        candidate = candidate[active]
-        # [C, N]: compare channel vectors at each position, then average.
         return torch.nn.functional.cosine_similarity(
-            original, candidate, dim=0, eps=1e-8
+            original.to(candidate.device), candidate, dim=1, eps=1e-8
         ).mean().item()
+
+
+def average_neighbor_patches(image: Image.Image, patch_box) -> Tuple[Image.Image, int]:
+    """Average center plus four one-patch-away neighbors at matching pixel phases.
+
+    Boundaries use only available image pixels, without padding.
+    """
+    left, top, right, bottom = patch_box
+    pw, ph = right-left, bottom-top
+    pixels = np.asarray(image.convert("RGB"), dtype=np.float64)
+    total = np.zeros((ph, pw, 3), dtype=np.float64)
+    counts = np.zeros((ph, pw, 1), dtype=np.float64)
+    used = 0
+    for dx, dy in ((0, 0), (-pw, 0), (pw, 0), (0, -ph), (0, ph)):
+        x, y = left+dx, top+dy
+        x0, y0 = max(0, x), max(0, y)
+        x1, y1 = min(image.width, x+pw), min(image.height, y+ph)
+        if x0 >= x1 or y0 >= y1:
+            continue
+        dst = (slice(y0-y, y1-y), slice(x0-x, x1-x))
+        total[dst] += pixels[y0:y1, x0:x1]
+        counts[dst] += 1
+        used += 1
+    return Image.fromarray(np.rint(total/counts).clip(0, 255).astype(np.uint8)), used
 
 
 def create_period_patches(
@@ -458,10 +405,10 @@ def create_period_patches(
     candidates: List[FftPeakCandidate],
     score_method: str = "ncc",
     feature_maps: dict | None = None,
-    feature_output_dir: str | None = None,
     rank_small: bool = False,
+    vgg_feature: str = "dense",
 ) -> List[PatchResult]:
-    # Step 12c: Make nine center patches (1x..3x), excluding their own central source region for VGG scoring.
+    # Make nine averaged representative patches (1x..3x).
     if score_method not in ("ncc", "vgg19"):
         raise ValueError("score_method must be ncc or vgg19")
     w, h = image.size
@@ -476,21 +423,23 @@ def create_period_patches(
 
     base_dx = abs(x_candidates[0].dx)
     base_dy = abs(y_candidates[0].dy)
+    base_patch_w = max(1, round(base_dx))
+    base_patch_h = max(1, round(base_dy))
     # Add one base period regardless of the patch multiplier; odd pixels go right/bottom.
-    extra_w, extra_h = max(1, round(base_dx)), max(1, round(base_dy))
+    extra_w, extra_h = base_patch_w, base_patch_h
     
     results: List[PatchResult] = []
     for dy_mult in range(1, 4):
         for dx_mult in range(1, 4):
-            patch_w = int(round(base_dx * dx_mult))
-            patch_h = int(round(base_dy * dy_mult))
+            patch_w = base_patch_w * dx_mult
+            patch_h = base_patch_h * dy_mult
             # patch사이즈를 1부터 이미지 사이즈까지로 벗어나지 않게 조정
             patch_w, patch_h = max(1, min(w, patch_w)), max(1, min(h, patch_h))
             left, top =round((w - patch_w) / 2), round((h - patch_h) / 2)
             right, bottom = left + patch_w, top + patch_h
 
             ''' image_patch, extended, reference '''
-            image_patch = image.crop((left, top, right, bottom))
+            image_patch, averaged_patch_count = average_neighbor_patches(image, (left, top, right, bottom))
             extended = extend_patch_edges(image_patch, extra_w, extra_h)
           
             box = ( left - extra_w // 2, top - extra_h // 2, right + extra_w - extra_w // 2, bottom + extra_h - extra_h // 2)
@@ -507,10 +456,7 @@ def create_period_patches(
             if score_method == "vgg19":
                 tiled = tile_patch_to_image(image_patch, image.size, (left, top, right, bottom))
                 score = vgg19_score(feature_maps, image_patch, image,
-                                    (left, top, right, bottom), tiled,
-                                    feature_output_path=(os.path.join(
-                                        feature_output_dir, f"tiled_feature_map_dx{dx_mult}_dy{dy_mult}.png")
-                                        if feature_output_dir is not None else None))
+                                    (left, top, right, bottom), tiled, feature_mode=vgg_feature)
                 status = "ok" if np.isfinite(score) else "no_comparison_signal"
             else:
                 score = (opencv_ncc(extended, reference, margin_mask)
@@ -520,21 +466,25 @@ def create_period_patches(
                                    patch_height=image_patch.height,
                                    comparison_width=extended.width, comparison_height=extended.height,
                                    score_method=score_method, status=status, rank="")
+            metadata["averaged_patch_count"] = averaged_patch_count
             metadata[score_key] = score
             if score_method == "vgg19":
-                metadata.update(comparison_width=w, comparison_height=h, score_metric="spatial_feature_cosine_similarity")
+                metadata.update(comparison_width=w, comparison_height=h,
+                                vgg_feature=vgg_feature,
+                                score_metric=("conv4_4_spatial_cosine_similarity" if vgg_feature == "conv"
+                                              else "final_dense_cosine_similarity"))
             results.append(PatchResult(image_patch, extended, reference, metadata, tiled))
 
     return rank_period_patches(results, score_method, rank_small)
 
 
 def select_final_periods(image, vote_x, vote_y, score_method="ncc", feature_maps=None,
-                         feature_output_dir=None, rank_small=False):
+                         rank_small=False, vgg_feature="dense"):
     """Keep each axis vote winner regardless of subsequent patch scores."""
     candidates = candidates_from_axis_period_peaks(
         (image.height, image.width), vote_x.peaks, vote_y.peaks)
     results = create_period_patches(image, candidates, score_method, feature_maps,
-                                    feature_output_dir, rank_small)
+                                    rank_small=rank_small, vgg_feature=vgg_feature)
     return (vote_x.amplitude, vote_y.amplitude, vote_x.peaks, vote_y.peaks,
             candidates, results)
 
@@ -550,8 +500,10 @@ def main() -> None:
 
     parser.add_argument("--score-method", choices=("ncc", "vgg19"), default="ncc",
                         help="Patch similarity method (default: ncc).")
+    parser.add_argument("--vgg-feature", choices=("conv", "dense"), default="dense",
+                        help="VGG19 features: conv4_4 full spatial map or final dense logits (default: dense).")
     parser.add_argument("--rank-small", action="store_true",
-                        help="VGG only: rank candidates within 0.05 of the best score by dx*dy scale, smallest first.")
+                        help="Deprecated compatibility option; ranking always uses similarity score only.")
     args = parser.parse_args()
     if args.rank_small and args.score_method != "vgg19":
         parser.error("--rank-small requires --score-method vgg19")
@@ -565,22 +517,22 @@ def main() -> None:
     fft_option = args.fout_opt.lower()
     patch_option = args.pout_opt.lower()
 
-    feature_maps = None
-    if args.score_method == "vgg19":
-        feature_maps = vgg19(image, args.output_dir)
+    feature_maps = (extract_vgg19_features(image, args.vgg_feature)
+                    if args.score_method == "vgg19" else None)
 
     # Step 14b: Build 1D FFT axis profiles, then hand only visualization to the draw module.
     ks, amp_x, amp_y, axis_peaks_x, axis_peaks_y, vote_x, vote_y = axis_period_profiles(
         rgb, include_votes=True)
     amp_x, amp_y, axis_peaks_x, axis_peaks_y, candidates, results = select_final_periods(
-        image, vote_x, vote_y, args.score_method, feature_maps, args.output_dir, args.rank_small)
+        image, vote_x, vote_y, args.score_method,
+        feature_maps=feature_maps, rank_small=args.rank_small, vgg_feature=args.vgg_feature)
     save_axis_period_functions(
         ks,
         amp_x,
         amp_y,
         axis_peaks_x,
         axis_peaks_y,
-        os.path.join(args.output_dir, "axis_period_functions.png"),
+        os.path.join(args.output_dir, f"{image_id(args.image)}_axis.png"),
         os.path.basename(args.image),
     )
 
@@ -598,13 +550,13 @@ def main() -> None:
         draw_spatial_domain_peaks(
             image,
             candidates,
-            os.path.join(args.output_dir, "spatial_domain_peaks.png"),
+            os.path.join(args.output_dir, f"{image_id(args.image)}_period.png"),
             visual_limit=visual_limit,
         )
     if patch_option == "off":
         print("Patch output is disabled. Skipping patch image output.")
     else:
-        save_period_patches(image, results, args.output_dir, args.score_method)
+        save_ranked_patches(image, results, args.output_dir, args.score_method, args.image)
 
     print(f"output_dir: {args.output_dir}")
     print(f"image_size: width={image.size[0]}, height={image.size[1]}")

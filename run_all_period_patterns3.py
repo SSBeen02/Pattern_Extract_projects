@@ -22,6 +22,8 @@ def natural_sort_key(path: Path) -> list[object]:
 
 def output_name(generated_name: str, index: int) -> str:
     """Map FFT output names to the requested two-digit-prefixed flat names."""
+    if generated_name.startswith(f"{index:02d}_"):
+        return generated_name
     if generated_name == "axis_period_functions.png":
         suffix = "axis.png"
     elif generated_name == "spatial_domain_peaks.png":
@@ -45,6 +47,8 @@ def main() -> None:
                         help="Output folder. Relative paths use the script folder.")
     parser.add_argument("--score-method", "--score_method", choices=("ncc", "vgg19"),
                         default="ncc", help="Patch scoring method (default: ncc).")
+    parser.add_argument("--vgg-feature", choices=("conv", "dense"), default="dense",
+                        help="VGG19 feature source: conv4_4 or final dense logits (default: dense).")
     parser.add_argument("--rank-small", action="store_true",
                         help="VGG only: prioritize smaller scales within 0.05 of the highest score.")
     parser.add_argument("--fout-opt", choices=("on", "off"), default="on",
@@ -74,6 +78,7 @@ def main() -> None:
     print(f"input_dir: {input_dir}")
     print(f"output_dir: {output_dir}")
     print(f"score_method: {args.score_method}")
+    print(f"vgg_feature: {args.vgg_feature}")
     print(f"rank_small: {args.rank_small}")
 
     for index, source in enumerate(images,start=1):
@@ -89,6 +94,7 @@ def main() -> None:
                     "--image", str(source),
                     "--output_dir", str(work_dir),
                     "--score-method", args.score_method,
+                    "--vgg-feature", args.vgg_feature,
                     "--fout-opt", args.fout_opt,
                     "--pout-opt", args.pout_opt,
                 ]
