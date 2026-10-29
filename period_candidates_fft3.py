@@ -1,11 +1,20 @@
 from __future__ import annotations
 
+# VGG19 features의 0-based convolution 인덱스. 아래 값만 바꾸면 됩니다.
+# conv1_1=0,  conv1_2=2
+# conv2_1=5,  conv2_2=7
+# conv3_1=10, conv3_2=12, conv3_3=14, conv3_4=16
+# conv4_1=19, conv4_2=21, conv4_3=23, conv4_4=25
+# conv5_1=28, conv5_2=30, conv5_3=32, conv5_4=34
+# 각 convolution 다음 인덱스는 ReLU입니다. 기존처럼 ReLU까지 적용합니다.
+VGG_CONV_LAYER_INDEX = 16
+
 import argparse
 import math
 import os
 from functools import lru_cache
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import Callable, List, Tuple
 
 import numpy as np  
 from PIL import Image
@@ -18,7 +27,7 @@ from period_candidates_visualization import (
     save_axis_period_functions,
     save_period_patches,
 )
-''' ncc or vgg: conv4_4 or dense 선택'''
+''' ncc or vgg: configured convolution layer or dense 선택'''
 #cosine 
 AXIS_PROFILE_MAX_K = 100
 AXIS_PEAK_RELATIVE_THRESHOLD = 0.5
@@ -57,6 +66,7 @@ def axis_period_profiles(
     rgb: np.ndarray,
     max_k: int = AXIS_PROFILE_MAX_K,
     include_votes: bool = False,
+    peak_selector: Callable | None = None,
 ):
     # Standardize RGB channels before FFT; spectra are not separately scaled.
     rgb = np.array([normalize_channel(channel) for channel in rgb.transpose(2, 0, 1)]).transpose(1, 2, 0)
@@ -124,8 +134,8 @@ def axis_period_profiles(
     if not np.any(valid_y):
         valid_y = np.ones(ks.shape, dtype=bool)
 
-    vote_x = vote_axis_peaks("x", ks, [amp_0x, amp_1x, amp_2x], valid_x, w)
-    vote_y = vote_axis_peaks("y", ks, [amp_0y, amp_1y, amp_2y], valid_y, h)
+    vote_x = vote_axis_peaks("x", ks, [amp_0x, amp_1x, amp_2x], valid_x, w, peak_selector)
+    vote_y = vote_axis_peaks("y", ks, [amp_0y, amp_1y, amp_2y], valid_y, h, peak_selector)
     result = (ks, vote_x.amplitude, vote_y.amplitude, vote_x.peaks, vote_y.peaks)
     return (*result, vote_x, vote_y) if include_votes else result
 
@@ -136,13 +146,14 @@ class AxisPeakVote:
     amplitude: np.ndarray
 
 
-def vote_axis_peaks(axis, ks, amplitudes, valid, image_size) -> AxisPeakVote:
+def vote_axis_peaks(axis, ks, amplitudes, valid, image_size, peak_selector=None) -> AxisPeakVote:
     """Vote by the selected FFT bin, independent of channel amplitudes.
 
     Retain each channel's subpixel estimate. The first agreeing channel supplies
     the majority estimate. With three distinct bins, use the strongest peak.
     """
-    peaks = [select_axis_amplitude_peaks(axis, ks, amp, valid, image_size)
+    selector = peak_selector or select_axis_amplitude_peaks
+    peaks = [selector(axis, ks, amp, valid, image_size)
              for amp in amplitudes]
     groups = {}
     for channel, selected in enumerate(peaks):
@@ -305,12 +316,24 @@ def opencv_ncc(first: Image.Image, second: Image.Image, mask: np.ndarray = None)
 @lru_cache(maxsize=1)
 def _vgg19_dense_model():
     from torchvision import models
-    # Full forward returns classifier[6] logits, before softmax.
+    # Keep the full model available for convolutional and FC1 extraction.
     return models.vgg19(weights=models.VGG19_Weights.DEFAULT).eval()
 
 
+def vgg_conv_layer_name() -> str:
+    layers = {
+        0: "conv1_1", 2: "conv1_2", 5: "conv2_1", 7: "conv2_2",
+        10: "conv3_1", 12: "conv3_2", 14: "conv3_3", 16: "conv3_4",
+        19: "conv4_1", 21: "conv4_2", 23: "conv4_3", 25: "conv4_4",
+        28: "conv5_1", 30: "conv5_2", 32: "conv5_3", 34: "conv5_4",
+    }
+    if VGG_CONV_LAYER_INDEX not in layers:
+        raise ValueError(f"Invalid VGG_CONV_LAYER_INDEX: {VGG_CONV_LAYER_INDEX}; choose from {tuple(layers)}")
+    return layers[VGG_CONV_LAYER_INDEX]
+
+
 def extract_vgg19_features(image: Image.Image, feature_mode: str = "dense") -> dict:
-    """Extract final logits or conv4_4 activations without saving feature images."""
+    """Extract FC1 ReLU outputs or configured conv activations without saving feature images."""
     import torch
     from torchvision import transforms
     if feature_mode not in ("conv", "dense"):
@@ -323,9 +346,11 @@ def extract_vgg19_features(image: Image.Image, feature_mode: str = "dense") -> d
         ])(image.convert("RGB")).unsqueeze(0)
         model = _vgg19_dense_model()
         if feature_mode == "conv":
-            # features[25] is conv4_4; features[26] is its ReLU, before pool4.
-            return {"conv4_4": model.features[:27](tensor)}
-        return {"dense_final": model(tensor)}
+            layer_name = vgg_conv_layer_name()
+            return {layer_name: model.features[:VGG_CONV_LAYER_INDEX + 2](tensor)}
+        features = model.avgpool(model.features(tensor))
+        # classifier[:2] applies FC1 and ReLU (4096 outputs), before dropout.
+        return {"dense_fc1": model.classifier[:2](torch.flatten(features, 1))}
 
 
 def tile_patch_to_image(patch: Image.Image, image_size: Tuple[int, int],
@@ -365,7 +390,7 @@ def vgg19_score(feature_maps: dict, patch: Image.Image, image: Image.Image,
         tiled = tile_patch_to_image(patch, image.size, patch_box)
     with torch.no_grad():
         tiled_maps = extract_vgg19_features(tiled, feature_mode)
-        key = "conv4_4" if feature_mode == "conv" else "dense_final"
+        key = vgg_conv_layer_name() if feature_mode == "conv" else "dense_fc1"
         original, candidate = feature_maps[key], tiled_maps[key]
         if original.shape != candidate.shape:
             raise ValueError("Original and tiled feature shapes must match")
@@ -439,7 +464,10 @@ def create_period_patches(
             right, bottom = left + patch_w, top + patch_h
 
             ''' image_patch, extended, reference '''
-            image_patch, averaged_patch_count = average_neighbor_patches(image, (left, top, right, bottom))
+            # VGG uses the five-region average; NCC uses the unmodified center crop.
+            averaged_patch, averaged_patch_count = average_neighbor_patches(image, (left, top, right, bottom))
+            image_patch = (averaged_patch if score_method == "vgg19"
+                           else image.crop((left, top, right, bottom)))
             extended = extend_patch_edges(image_patch, extra_w, extra_h)
           
             box = ( left - extra_w // 2, top - extra_h // 2, right + extra_w - extra_w // 2, bottom + extra_h - extra_h // 2)
@@ -471,8 +499,9 @@ def create_period_patches(
             if score_method == "vgg19":
                 metadata.update(comparison_width=w, comparison_height=h,
                                 vgg_feature=vgg_feature,
-                                score_metric=("conv4_4_spatial_cosine_similarity" if vgg_feature == "conv"
-                                              else "final_dense_cosine_similarity"))
+                                vgg_layer=(vgg_conv_layer_name() if vgg_feature == "conv" else "fc1"),
+                                score_metric=(f"{vgg_conv_layer_name()}_spatial_cosine_similarity" if vgg_feature == "conv"
+                                              else "fc1_cosine_similarity"))
             results.append(PatchResult(image_patch, extended, reference, metadata, tiled))
 
     return rank_period_patches(results, score_method, rank_small)
@@ -501,7 +530,7 @@ def main() -> None:
     parser.add_argument("--score-method", choices=("ncc", "vgg19"), default="ncc",
                         help="Patch similarity method (default: ncc).")
     parser.add_argument("--vgg-feature", choices=("conv", "dense"), default="dense",
-                        help="VGG19 features: conv4_4 full spatial map or final dense logits (default: dense).")
+                        help=f"VGG19 features: {vgg_conv_layer_name()} full spatial map or FC1 ReLU outputs (default: dense).")
     parser.add_argument("--rank-small", action="store_true",
                         help="Deprecated compatibility option; ranking always uses similarity score only.")
     args = parser.parse_args()

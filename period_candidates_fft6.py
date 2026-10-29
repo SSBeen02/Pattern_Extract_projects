@@ -1,15 +1,18 @@
-"""FFT3의 5영역 평균 패치를 NCC와 VGG19 conv4_4 점수로 함께 평가한다.
+"""FFT3의 후보를 원본 중앙 패치 NCC와 평균 패치 VGG19 점수로 평가한다.
 
-1. FFT3의 RGB FFT, 축별 다수결, 1~3배 후보 생성 방식을 사용한다.
+1. FFT3의 RGB FFT와 축별 다수결을 사용하되, FFT6의 peak 임계값은
+   최대진폭 * max(0.3, 1 - 0.3 * (k - 1) / (k_max - 1))로 정한다.
+   선택한 주기로 1~3배 후보를 만든다.
 2. 각 후보는 중앙 및 상하좌우 5영역을 평균한 패치로 만든다.
-3. NCC는 FFT3과 동일하게 확장 패치의 바깥 여백과 원본의 같은 위치를
+3. NCC는 평균 전 원본 중앙 패치를 한 주기(dx, dy)만큼 반복 확장하고,
+   확장 패치의 바깥 여백과 원본의 같은 위치를
    비교한다. 비교 영역이 원본 밖이면 NCC는 미판정이다.
 4. conv4_4 점수는 이 평균 패치를 원본 크기로 타일링하고 VGG19의
    conv4_4 특징맵 전체 공간 위치의 채널 벡터 cosine 평균으로 비교한다.
-5. 최종 점수 = 0.5 * NCC + 0.5 * conv4_4. 두 값이 모두 유효할 때만 순위를
+5. 최종 점수 = 0.9 * NCC + 0.1 * conv4_4. 두 값이 모두 유효할 때만 순위를
    부여한다. 후보별 원점수, 결합점수, 상태를 CSV와 montage에 기록한다.
 
-FFT3과 FFT5의 코드는 수정하지 않는다.
+FFT5의 코드는 수정하지 않는다.
 """
 from __future__ import annotations
 
@@ -25,15 +28,49 @@ from PIL import Image
 import period_candidates_fft3 as fft3
 from period_output_naming import candidate_prefix, image_id, save_compact_montage
 
+THRESHOLD_S = 0.3
+THRESHOLD_MIN = 0.3
 
-def ncc_for_patch(result):
-    """Reproduce FFT3's margin-only NCC for an already averaged patch."""
+
+def select_axis_amplitude_peaks(axis, ks, amplitude, valid, image_size):
+    """FFT6-only peak selection; switch the two threshold lines to revert."""
+    indices = np.flatnonzero(valid & np.isfinite(ks) & (ks > 0))
+    if indices.size == 0:
+        return []
+    finite_indices = indices[np.isfinite(amplitude[indices])]
+    if not finite_indices.size or not np.any(amplitude[finite_indices] > 0):
+        return []
+    max_amplitude = float(np.max(amplitude[finite_indices]))
+    k_max = float(ks[-1])
+    peak_indices = []
+    for index in indices:
+        k = float(ks[index])
+        # To restore FFT3's old rule, comment the next line and uncomment the one below.
+        threshold = max_amplitude * max(THRESHOLD_MIN, 1 - THRESHOLD_S * (k - 1) / max(1, k_max - 1))
+        # threshold = max_amplitude / (k ** fft3.alpha)
+        left = amplitude[index - 1] if index > 0 else -np.inf
+        right = amplitude[index + 1] if index < amplitude.size - 1 else -np.inf
+        if np.isfinite(amplitude[index]) and amplitude[index] >= threshold and amplitude[index] >= max(left, right):
+            peak_indices.append(index)
+    final_index = max(peak_indices, key=lambda i: float(ks[i]), default=-1)
+    if final_index < 0:
+        return []
+    k, value = fft3.refine_profile_peak(ks, amplitude, final_index)
+    return [fft3.AxisPeriodPeak(axis, k, image_size / k if k > 0 else float("inf"), value, "amplitude")]
+
+
+def ncc_for_patch(image, result):
+    """Compare the raw center crop's repeated margin with the original margin."""
     if result.reference is None:
         return float("nan")
-    patch = result.image_patch
-    extended = result.extended
-    extra_w = extended.width - patch.width
-    extra_h = extended.height - patch.height
+    row = result.metadata
+    patch_w, patch_h = row["patch_width"], row["patch_height"]
+    left = round((image.width - patch_w) / 2)
+    top = round((image.height - patch_h) / 2)
+    patch = image.crop((left, top, left + patch_w, top + patch_h))
+    extra_w = result.extended.width - patch_w
+    extra_h = result.extended.height - patch_h
+    extended = fft3.extend_patch_edges(patch, extra_w, extra_h)
     mask = np.ones((extended.height, extended.width), dtype=bool)
     mask[extra_h // 2:extra_h // 2 + patch.height,
          extra_w // 2:extra_w // 2 + patch.width] = False
@@ -50,8 +87,8 @@ def combined_patches(image, candidates):
     for result in results:
         row = result.metadata
         conv = row["vgg19_score"]
-        ncc = ncc_for_patch(result)
-        combined = 0.5 * ncc + 0.5 * conv
+        ncc = ncc_for_patch(image, result)
+        combined = 0.9 * ncc + 0.1 * conv
         row.update(conv4_4_score=conv, ncc_score=ncc, combined_score=combined,
                    score_method="combined", score_metric="half_ncc_half_vgg19_conv4_4",
                    status="ok" if math.isfinite(combined) else
@@ -98,7 +135,8 @@ def main():
     args = parser.parse_args()
 
     image, rgb = fft3.load_rgb(args.image)
-    ks, _, _, _, _, vote_x, vote_y = fft3.axis_period_profiles(rgb, include_votes=True)
+    ks, _, _, _, _, vote_x, vote_y = fft3.axis_period_profiles(
+        rgb, include_votes=True, peak_selector=select_axis_amplitude_peaks)
     candidates = fft3.candidates_from_axis_period_peaks(
         rgb.shape[:2], vote_x.peaks, vote_y.peaks)
     if not candidates:

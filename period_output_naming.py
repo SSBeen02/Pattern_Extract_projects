@@ -38,7 +38,7 @@ def save_compact_montage(image, result, output_path) -> None:
         if key in row:
             scores.append(f"{label}={row[key]:.6f}")
     if not scores and "vgg19_score" in row:
-        label = "VGG19 conv4_4" if row.get("vgg_feature") == "conv" else "VGG19 dense"
+        label = f"VGG19 {row.get('vgg_layer', 'conv4_4')}" if row.get("vgg_feature") == "conv" else "VGG19 dense"
         scores.append(f"{label}={row['vgg19_score']:.6f}")
     if row["status"] != "ok":
         scores.append(row["status"])

@@ -48,7 +48,7 @@ def main() -> None:
     parser.add_argument("--score-method", "--score_method", choices=("ncc", "vgg19"),
                         default="ncc", help="Patch scoring method (default: ncc).")
     parser.add_argument("--vgg-feature", choices=("conv", "dense"), default="dense",
-                        help="VGG19 feature source: conv4_4 or final dense logits (default: dense).")
+                        help="VGG19 feature source: convolution layer configured in FFT3 or FC1 ReLU outputs (default: dense).")
     parser.add_argument("--rank-small", action="store_true",
                         help="VGG only: prioritize smaller scales within 0.05 of the highest score.")
     parser.add_argument("--fout-opt", choices=("on", "off"), default="on",
