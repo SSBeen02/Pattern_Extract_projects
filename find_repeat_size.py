@@ -26,6 +26,7 @@ class RepeatResult:
 def _axis_period(gray: np.ndarray, axis: int, max_size: int = 1024) -> float | None:
     """Find the smallest strong whole-image translation on one axis."""
     image_axis_length = gray.shape[axis]
+    # 큰 입력은 계산량을 줄이기 위해 축 비율을 유지하며 축소한다.
     # Keep images up to 1024 pixels at native resolution; downsample larger ones.
     scale = min(1.0, max_size / max(gray.shape))
     if scale < 1:
@@ -34,9 +35,11 @@ def _axis_period(gray: np.ndarray, axis: int, max_size: int = 1024) -> float | N
     else:
         im = Image.fromarray(np.uint8(np.clip(gray * 255, 0, 255)))
     # Fabric weave is high-frequency noise relative to the printed motif.
+    # 직조의 미세한 질감보다 큰 반복 무늬에 집중한다.
     im = im.filter(ImageFilter.GaussianBlur(max(im.size) / 256))
     gray = np.asarray(im, dtype=np.float32) / 255
     actual_scale = gray.shape[axis] / image_axis_length
+    # 이미지 안에서 무늬가 3~100회 반복된다고 가정해 이동 거리 범위를 정한다.
     lo = max(1, math.ceil(gray.shape[axis] / 100))  # At most 100 repeats.
     hi = min(gray.shape[axis] - 1, math.floor(gray.shape[axis] / 3))  # At least 3 repeats.
     if hi <= lo:
@@ -47,7 +50,9 @@ def _axis_period(gray: np.ndarray, axis: int, max_size: int = 1024) -> float | N
     if float(np.var(gray)) < 0.0001:
         return None
     for shift in range(lo, hi + 1):
+        # shift만큼 떨어진 두 겹침 영역을 같은 크기로 잘라 비교한다.
         a, b = (gray[:, shift:], gray[:, :-shift]) if axis == 1 else (gray[shift:, :], gray[:-shift, :])
+        # 각 영역의 평균을 빼서 전체 밝기 차이를 제거한다.
         a = a - a.mean()
         b = b - b.mean()
         denom = float(np.sqrt(np.mean(a * a) * np.mean(b * b)))
@@ -58,6 +63,7 @@ def _axis_period(gray: np.ndarray, axis: int, max_size: int = 1024) -> float | N
         return None
     baseline = float(np.nanmedian(finite))
     maximum = float(np.nanmax(finite))
+    # 중앙값은 임의의 이동 거리에서 나오는 일반적인 유사도의 기준이다.
     # A repeat must be substantially better than arbitrary translations.
     if baseline > 0.995 or maximum < max(0.45, 1 - (1 - baseline) * 0.58):
         return None
@@ -65,18 +71,23 @@ def _axis_period(gray: np.ndarray, axis: int, max_size: int = 1024) -> float | N
     threshold = max(0.45, 1 - (1 - baseline) * 0.58, maximum - 0.01)
     candidates = []
     for shift in range(lo + 1, hi):
+        # 기준값 이상이고 바로 양옆보다 높거나 같으면 국소 최댓값으로 인정한다.
         if scores[shift] >= threshold and scores[shift] >= scores[shift - 1] and scores[shift] >= scores[shift + 1]:
             candidates.append(shift)
     if not candidates:
+        # 경계에 최고점이 있거나 국소 최댓값 조건을 만족하지 못하면 전체 최고점을 쓴다.
         candidates = [int(np.nanargmax(scores[lo:hi + 1]) + lo)]
+    # 배수 주기보다 기본 주기를 우선하기 위해 통과한 후보 중 가장 작은 이동량을 택한다.
     chosen = min(candidates)
     # Parabolic interpolation gives a fractional-pixel estimate.
     offset = 0.0
     if lo < chosen < hi:
+        # 최고점과 양옆 점수에 포물선을 맞춰 픽셀 사이의 피크 위치를 추정한다.
         left, center, right = map(float, scores[chosen - 1:chosen + 2])
         curvature = left - 2 * center + right
         if curvature < -1e-8:
             offset = float(np.clip(0.5 * (left - right) / curvature, -0.5, 0.5))
+    # 축소 이미지에서 구한 거리를 원본 이미지의 픽셀 단위로 환산한다.
     return round((chosen + offset) / actual_scale, 1)
 
 
@@ -85,10 +96,12 @@ def find_repeat_size(image: Image.Image | str | Path, max_size: int = 1024) -> R
     if not isinstance(image, Image.Image):
         image = Image.open(image)
     gray = np.asarray(image.convert("L"), dtype=np.float32) / 255
+    # 가로와 세로의 반복 간격을 독립적으로 탐색한다.
     x = _axis_period(gray, 1, max_size)
     y = _axis_period(gray, 0, max_size)
     if x is None and y is None:
         return None
+    # 한 축에서 주기를 찾지 못한 경우 100px을 표시용 기본값으로 채운다.
     return RepeatResult(x if x is not None else 100.0,
                         y if y is not None else 100.0,
                         x is not None, y is not None)
@@ -103,6 +116,7 @@ def save_visualization(image: Image.Image | str | Path, result: RepeatResult | N
     draw = ImageDraw.Draw(canvas, "RGBA")
     w, h = canvas.size
     if result is not None:
+        # 추정한 반복 크기의 사각형을 이미지 중앙에 그린다.
         left = round((w - result.width) / 2)
         top = round((h - result.height) / 2)
         draw.rectangle((left, top, round(left + result.width), round(top + result.height)),
@@ -131,6 +145,7 @@ def save_tiled_image(image: Image.Image | str | Path, result: RepeatResult,
     top = (source.height - height) // 2
     patch = source.crop((left, top, left + width, top + height))
 
+    # 중앙 패치를 1024 × 1024 캔버스 전체에 반복 배치한다.
     canvas = Image.new("RGB", (1024, 1024))
     start_x = (1024 - width) // 2
     start_y = (1024 - height) // 2
@@ -145,6 +160,7 @@ def save_tiled_image(image: Image.Image | str | Path, result: RepeatResult,
 
 
 def main() -> None:
+    """입력 이미지(또는 폴더)를 처리하고 주기 표시 이미지와 타일 이미지를 저장한다."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "image", nargs="?", type=Path,
